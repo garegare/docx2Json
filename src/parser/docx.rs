@@ -105,6 +105,7 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
     let mut current_text = String::new();           // 現在の段落テキスト
     let mut current_assets: Vec<Asset> = Vec::new(); // 現在の段落の画像
     let mut drawing_rid: Option<String> = None;     // 処理中の drawing の rId
+    let mut drawing_title: Option<String> = None;   // 処理中の drawing のタイトル（wp:docPr から取得）
     let mut in_paragraph = false;
     let mut paragraph_style: Option<String> = None;
 
@@ -250,7 +251,16 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                 if in_ins > 0 { in_ins -= 1; }
             }
 
-            // ---- 画像参照 ----
+            // ---- 画像メタデータ（wp:docPr）----
+            // <wp:docPr id="1" name="図 2" descr="代替テキスト"/>
+            // descr（代替テキスト/alt text）を優先し、なければ name を使用
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"docPr" => {
+                let descr = attr_value(&e, "descr").filter(|s| !s.trim().is_empty());
+                let name  = attr_value(&e, "name").filter(|s| !s.trim().is_empty());
+                drawing_title = descr.or(name);
+            }
+
+            // ---- 画像参照（a:blip）----
             // a:blip は子要素を持つ場合(Start)と自己閉じ(Empty)の両方がある
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"blip" => {
                 // a:blip r:embed="rId5"
@@ -259,11 +269,13 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                 }
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"drawing" => {
+                // drawing 終了時に rId と title をまとめて Asset 化
+                let title = drawing_title.take().unwrap_or_default();
                 if let Some(rid) = drawing_rid.take() {
                     if let Some(b64) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
-                            title: String::new(),
+                            title,
                             data: b64.clone(),
                         });
                     }
