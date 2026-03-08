@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use image::codecs::jpeg::JpegEncoder;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use zip::ZipArchive;
@@ -30,7 +31,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
         .context("リレーションシップファイルのパースに失敗")?;
 
     // 画像データをBase64で取得
-    let images = extract_images(&mut archive, &rels)
+    let images = extract_images(&mut archive, &rels, config)
         .context("画像の抽出に失敗")?;
 
     // numbering.xml から箇条書き定義を取得（存在しない場合は空マップ）
@@ -76,20 +77,54 @@ fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<Hash
 }
 
 /// ZIP内の画像ファイルをBase64エンコードして返す
+/// config.image_max_px > 0 の場合、長辺をその値に収まるようリサイズし JPEG 再エンコードする
 fn extract_images(
     archive: &mut ZipArchive<BufReader<std::fs::File>>,
     rels: &HashMap<String, String>,
+    config: &Config,
 ) -> Result<HashMap<String, String>> {
     let mut images = HashMap::new();
     for (rid, zip_path) in rels {
         if let Ok(mut entry) = archive.by_name(zip_path) {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
+
+            // リサイズ・圧縮が有効な場合は画像を処理する
+            let final_buf = if config.image_max_px > 0 {
+                resize_and_compress(&buf, config.image_max_px, config.image_quality)
+                    .unwrap_or(buf) // 変換失敗時は元データをそのまま使用
+            } else {
+                buf
+            };
+
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&final_buf);
             images.insert(rid.clone(), encoded);
         }
     }
     Ok(images)
+}
+
+/// 画像データをリサイズして JPEG 形式で再エンコードする
+///
+/// - max_px: 長辺の最大ピクセル数（アスペクト比を維持してリサイズ）
+/// - quality: JPEG 品質（1〜100）
+/// - 変換できない場合は None を返す（呼び出し側で元データにフォールバック）
+fn resize_and_compress(data: &[u8], max_px: u32, quality: u8) -> Option<Vec<u8>> {
+    let img = image::load_from_memory(data).ok()?;
+
+    // リサイズが必要かチェック（長辺が max_px を超える場合のみ処理）
+    let img = if img.width() > max_px || img.height() > max_px {
+        img.thumbnail(max_px, max_px)
+    } else {
+        img
+    };
+
+    // JPEG は透過チャンネルを持たないため RGB に変換してからエンコード
+    let rgb = img.into_rgb8();
+    let mut output = Vec::new();
+    let encoder = JpegEncoder::new_with_quality(&mut output, quality);
+    rgb.write_with_encoder(encoder).ok()?;
+    Some(output)
 }
 
 /// word/numbering.xml を解析し、numId → Vec<numFmt> のマップを返す
