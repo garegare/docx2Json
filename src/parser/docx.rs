@@ -179,9 +179,10 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
             }
 
             // ---- 画像参照 ----
-            Ok(Event::Empty(e)) if e.local_name().as_ref() == b"blip" => {
+            // a:blip は子要素を持つ場合(Start)と自己閉じ(Empty)の両方がある
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"blip" => {
                 // a:blip r:embed="rId5"
-                if let Some(rid) = attr_value(&e, "r:embed").or_else(|| attr_value(&e, "embed")) {
+                if let Some(rid) = attr_value(&e, "embed") {
                     drawing_rid = Some(rid);
                 }
             }
