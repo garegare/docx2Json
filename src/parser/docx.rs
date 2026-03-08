@@ -511,6 +511,21 @@ fn parse_document_xml(
                 }
             }
 
+            // ---- ソフト改行（w:br）----
+            // <w:br/> または <w:br w:type="textWrapping"/> はラン内の強制改行。
+            // ページ区切り（w:type="page"）や段区切り（"column"）はテキストに含めない。
+            // セル内では <br> に、段落内では \n に変換する。
+            Ok(Event::Empty(e)) if in_del == 0 && e.local_name().as_ref() == b"br" => {
+                let br_type = attr_value(&e, "type").unwrap_or_default();
+                if br_type != "page" && br_type != "column" {
+                    if in_table == 1 && in_table_cell {
+                        current_cell_text.push_str("<br>");
+                    } else if in_paragraph {
+                        current_text.push('\n');
+                    }
+                }
+            }
+
             // ---- テキストノード ----
             Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr => {
                 let text = e.unescape().unwrap_or_default();
