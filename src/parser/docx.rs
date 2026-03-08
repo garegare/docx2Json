@@ -89,9 +89,9 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
-    // パーサー状態
+    // ---- 段落パーサー状態 ----
     let mut in_del = 0u32;           // w:del ネスト深さ
-    let mut in_ins = 0u32;           // w:ins ネスト深さ（未使用だがバランス追跡用）
+    let mut in_ins = 0u32;           // w:ins ネスト深さ（バランス追跡用）
     let mut in_ppr = false;          // w:pPr 内か
     let mut in_ppr_rpr = false;      // w:pPr > w:rPr 内か（段落デフォルト書式）
     let mut in_rpr = false;          // w:rPr 内か（ラン書式）
@@ -100,21 +100,90 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
     let mut current_text = String::new();           // 現在の段落テキスト
     let mut current_assets: Vec<Asset> = Vec::new(); // 現在の段落の画像
     let mut drawing_rid: Option<String> = None;     // 処理中の drawing の rId
-
-    // セクションスタック: (level, section)
-    // level 0 = ルート（Heading1）、level 1 = Heading2、...
-    // ルートの "children" が最終出力
-    let mut stack: Vec<(usize, Section)> = Vec::new();
-    // まだどのセクションにも属さない段落を受け取るルートセクション
-    let mut root_sections: Vec<Section> = Vec::new();
-
     let mut in_paragraph = false;
     let mut paragraph_style: Option<String> = None;
 
+    // ---- テーブルパーサー状態 ----
+    let mut in_table: u32 = 0;                      // w:tbl ネスト深さ
+    let mut in_table_cell = false;                  // w:tc 内か（最外テーブルのみ）
+    let mut current_cell_text = String::new();      // 現在のセルテキスト
+    let mut current_row: Vec<String> = Vec::new();  // 現在の行のセル
+    let mut table_rows: Vec<Vec<String>> = Vec::new(); // テーブル全行
+
+    // ---- セクションスタック ----
+    // (level, section) のスタック。ルートの children が最終出力。
+    let mut stack: Vec<(usize, Section)> = Vec::new();
+    let mut root_sections: Vec<Section> = Vec::new();
+
     loop {
         match reader.read_event() {
-            // ---- 段落開始 ----
-            Ok(Event::Start(e)) if e.local_name().as_ref() == b"p" => {
+
+            // ================================================================
+            // テーブル処理（w:tbl > w:tr > w:tc）
+            // ================================================================
+
+            // テーブル開始
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"tbl" => {
+                in_table += 1;
+                if in_table == 1 {
+                    table_rows.clear();
+                }
+            }
+            // テーブル終了: Markdownを生成して現在のセクションに挿入
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"tbl" => {
+                if in_table == 1 && !table_rows.is_empty() {
+                    let md = rows_to_markdown(&table_rows);
+                    if let Some((_, sec)) = stack.last_mut() {
+                        if !sec.body_text.is_empty() {
+                            sec.body_text.push('\n');
+                        }
+                        sec.body_text.push_str(&md);
+                    }
+                    table_rows.clear();
+                }
+                if in_table > 0 { in_table -= 1; }
+            }
+
+            // 行開始（最外テーブルのみ追跡）
+            Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"tr" => {
+                current_row.clear();
+            }
+            // 行終了: 行をテーブルに追加
+            Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tr" => {
+                if !current_row.is_empty() {
+                    table_rows.push(std::mem::take(&mut current_row));
+                }
+            }
+
+            // セル開始
+            Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
+                in_table_cell = true;
+                current_cell_text.clear();
+            }
+            // セル終了: テキストを行に追加
+            Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
+                if in_table_cell {
+                    current_row.push(current_cell_text.trim().to_string());
+                    current_cell_text.clear();
+                    in_table_cell = false;
+                }
+            }
+
+            // セル内の段落終了: 複数段落を持つセルの段落間区切り
+            Ok(Event::End(e)) if in_table > 0 && in_table_cell && e.local_name().as_ref() == b"p" => {
+                let trimmed = current_cell_text.trim_end().to_string();
+                if !trimmed.is_empty() {
+                    current_cell_text = trimmed;
+                    current_cell_text.push(' '); // 段落間スペース（tc End で trim される）
+                }
+            }
+
+            // ================================================================
+            // 段落処理（テーブル外のみ）
+            // ================================================================
+
+            // 段落開始
+            Ok(Event::Start(e)) if in_table == 0 && e.local_name().as_ref() == b"p" => {
                 in_paragraph = true;
                 paragraph_style = None;
                 ppr_underline = false;
@@ -147,18 +216,16 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                 in_ppr_rpr = false;
             }
 
-            // ---- 下線検出 ----
-            // Word で「見出し」スタイルを使わず下線で見出しを表現するケース
+            // ---- 下線検出（見出し判定用）----
             Ok(Event::Empty(e)) | Ok(Event::Start(e))
                 if e.local_name().as_ref() == b"u" =>
             {
                 let val = attr_value(&e, "w:val").or_else(|| attr_value(&e, "val"));
-                // w:val="none" は下線なし
                 if val.as_deref() != Some("none") {
                     if in_ppr_rpr {
-                        ppr_underline = true;  // 段落デフォルト書式（pPr > rPr）
+                        ppr_underline = true;
                     } else if in_rpr && !in_ppr {
-                        run_underline = true;  // ラン書式（r > rPr）
+                        run_underline = true;
                     }
                 }
             }
@@ -199,18 +266,24 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
             }
 
             // ---- テキストノード ----
-            Ok(Event::Text(e)) if in_paragraph && in_del == 0 && !in_ppr && !in_rpr => {
+            Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr => {
                 let text = e.unescape().unwrap_or_default();
-                current_text.push_str(&text);
+                if in_table == 1 && in_table_cell {
+                    // テーブルセルのテキスト
+                    current_cell_text.push_str(&text);
+                } else if in_paragraph {
+                    // 通常段落のテキスト
+                    current_text.push_str(&text);
+                }
             }
 
-            // ---- 段落終了 ----
-            Ok(Event::End(e)) if e.local_name().as_ref() == b"p" => {
+            // ---- 段落終了（テーブル外のみ）----
+            Ok(Event::End(e)) if in_table == 0 && e.local_name().as_ref() == b"p" => {
                 if in_paragraph {
                     let style = paragraph_style.take();
                     let ppr_ul = std::mem::replace(&mut ppr_underline, false);
                     let run_ul = std::mem::replace(&mut run_underline, false);
-                    // pStyleによる検出を優先し、なければ下線フォールバック（設定で有効な場合）
+
                     let heading_level = style.as_deref()
                         .and_then(|s| config.heading_level_for_style(s))
                         .or_else(|| {
@@ -226,19 +299,16 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                     in_paragraph = false;
 
                     if let Some(level) = heading_level {
-                        // 空の見出しテキスト（装飾用の空行など）はスキップ
+                        // 空の見出し（装飾用の空行など）はスキップ
                         if body.is_empty() && assets.is_empty() {
-                            in_paragraph = false;
                             continue;
                         }
-                        // 新しいセクションを開始
                         let new_section = Section {
                             heading: body,
                             body_text: String::new(),
                             assets,
                             children: Vec::new(),
                         };
-
                         // スタックを巻き戻してこのレベルの親を探す
                         while stack.last().map_or(false, |(l, _)| *l >= level) {
                             let (_, finished) = stack.pop().unwrap();
@@ -253,8 +323,6 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                             }
                             sec.body_text.push_str(&body);
                             sec.assets.extend(assets);
-                        } else {
-                            // セクション外の段落は無視（またはルートに追加）
                         }
                     }
                 }
@@ -274,6 +342,37 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
     Ok(root_sections)
 }
 
+/// テーブルの行データをMarkdown形式に変換する
+/// 最初の行をヘッダーとして扱い、その後にセパレーター行を挿入する
+fn rows_to_markdown(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if cols == 0 {
+        return String::new();
+    }
+
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    for (i, row) in rows.iter().enumerate() {
+        // 不足列を空文字で埋め、パイプ文字をエスケープ
+        let cells: Vec<String> = (0..cols)
+            .map(|j| {
+                row.get(j)
+                    .map(|c| c.replace('|', r"\|"))
+                    .unwrap_or_default()
+            })
+            .collect();
+        lines.push(format!("| {} |", cells.join(" | ")));
+
+        // ヘッダー行（最初の行）の直後にセパレーターを挿入
+        if i == 0 {
+            lines.push(format!("| {} |", vec!["---"; cols].join(" | ")));
+        }
+    }
+    lines.join("\n")
+}
+
 /// セクションを適切な親に追加する
 fn push_to_parent(
     stack: &mut Vec<(usize, Section)>,
@@ -287,10 +386,8 @@ fn push_to_parent(
     }
 }
 
-
 /// XML要素から属性値を取得する（名前空間プレフィックスを無視）
 fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    // name は "w:val" や "val" のどちらでも可
     let local = name.split(':').last().unwrap_or(name);
     for attr in e.attributes().flatten() {
         let key = attr.key.local_name();
