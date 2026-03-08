@@ -12,7 +12,7 @@ pub fn parse_file(path: &Path, config: &Config) -> Result<Document> {
     let mut doc = match path.extension().and_then(|e| e.to_str()) {
         Some("docx") => docx::parse(path, config)
             .with_context(|| format!("DOCXパース失敗: {}", path.display()))?,
-        Some("xlsx") => xlsx::parse(path)
+        Some("xlsx") => xlsx::parse(path, config)
             .with_context(|| format!("XLSXパース失敗: {}", path.display()))?,
         ext => anyhow::bail!("未対応のファイル形式: {:?}", ext),
     };
