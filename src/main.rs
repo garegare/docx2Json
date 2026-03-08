@@ -33,6 +33,16 @@ struct Cli {
     /// セクションごとに個別 JSON ファイルを出力する（RAG 向け）
     #[arg(long, value_name = "LEVEL")]
     split: Option<usize>,
+
+    /// 画像の最大辺長（ピクセル）。超過する画像をこのサイズにリサイズし JPEG 再エンコードする。
+    /// 省略時はリサイズなし。設定ファイルの image_max_px より優先される。
+    #[arg(long, value_name = "PIXELS")]
+    image_max_px: Option<u32>,
+
+    /// JPEG 再エンコード品質（1〜100）。--image-max-px と組み合わせて使用する。
+    /// 省略時は設定ファイルの image_quality（デフォルト 80）を使用。
+    #[arg(long, value_name = "QUALITY")]
+    image_quality: Option<u8>,
 }
 
 fn main() {
@@ -44,7 +54,10 @@ fn main() {
     } else {
         cli.input.clone()
     };
-    let cfg = config::Config::load(cli.config.as_deref(), &input_dir);
+    let mut cfg = config::Config::load(cli.config.as_deref(), &input_dir);
+    // CLI 引数で画像設定を上書き（設定ファイルより優先）
+    if let Some(px) = cli.image_max_px { cfg.image_max_px = px; }
+    if let Some(q) = cli.image_quality  { cfg.image_quality = q.clamp(1, 100); }
 
     // 出力ディレクトリを作成
     if let Some(ref out) = cli.output {

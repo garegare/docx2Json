@@ -21,6 +21,7 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **箇条書きのMarkdown化** | ✅ | `w:numPr` を検知し `- ` / `1. ` 形式に変換。`word/numbering.xml` を参照し番号付き・箇条書きを判別。インデントレベル（`w:ilvl`）に応じてネストを表現。 |
 | **RAG最適化（context_path）** | ✅ | 各セクションにルートから自身への見出しパスリスト（`context_path`）を付与。チャンク分割後も文書内の位置をAIが把握可能。 |
 | **セクション単位のチャンク分割** | ✅ | `--split <level>` で指定した深さ（1=最上位）でセクションを分割し、セクションごとに個別 JSON を出力。子セクションの本文は Markdown 見出しとして統合。 |
+| **画像リサイズ・圧縮** | ✅ | `--image-max-px <N>` で長辺を N px にリサイズし JPEG 再エンコード。`--image-quality <Q>` で品質調整。JSON 肥大化を防止。 |
 | **AI連携フォーマッティング** | 🚧 | `--features ai` で有効化。API呼び出しは未実装。 |
 | **XLSXパース** | 🚧 | 構造のみ実装済み、本実装は今後の対応。 |
 
@@ -42,6 +43,7 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | 5 | **箇条書きのMarkdown化** | ✅ | `w:numPr` を検知し `- ` / `1. ` 形式に変換。`numbering.xml` を参照して番号付き・箇条書きを判別。`w:ilvl` のインデントレベルに応じてネストを表現 |
 | 6 | **RAG最適化（context_path）** | ✅ | 各セクションにルートから自身への見出しパスリスト（`context_path`）を付与。チャンク分割後も文書内の位置を保持 |
 | 7 | **セクション単位のチャンク分割** | ✅ | `--split <level>` で指定した深さでセクションを分割し個別 JSON を出力。子セクションは Markdown 見出しとして本文に統合。`source` / `context_path` を保持 |
+| 8 | **画像リサイズ・圧縮** | ✅ | `--image-max-px <N>` で長辺を N px に収めてリサイズし JPEG 再エンコード。`--image-quality <Q>` で品質指定。設定ファイル（`image_max_px` / `image_quality`）でも制御可能 |
 | 8 | **画像リサイズ・圧縮** | 🔲 | `image` クレートで高解像度画像をリサイズ（例: 1024px, JPEG 80%）してからBase64化。JSON肥大化を防止 |
 
 ### 🟢 優先度：低（拡張・特殊対応）
@@ -98,6 +100,12 @@ cargo run -- --input ./docs --output ./out --split 1
 
 # チャンク分割（2階層目単位で細かく分割）
 cargo run -- --input ./docs --output ./out --split 2
+
+# 画像リサイズ（長辺 1024px 以下に縮小、JPEG 品質 80%）
+cargo run -- --input ./docs --output ./out --image-max-px 1024
+
+# 画像リサイズ + 品質指定
+cargo run -- --input ./docs --output ./out --image-max-px 512 --image-quality 70
 ```
 
 ## ⚙️ 設定ファイル（`docx2json.json`）
@@ -116,7 +124,9 @@ cargo run -- --input ./docs --output ./out --split 2
     "見出し3": 3
   },
   "ppr_underline_as_heading": true,
-  "run_underline_as_heading": false
+  "run_underline_as_heading": false,
+  "image_max_px": 1024,
+  "image_quality": 80
 }
 ```
 
@@ -127,6 +137,8 @@ cargo run -- --input ./docs --output ./out --split 2
 | `heading_styles` | 標準スタイル名セット | `スタイル名: レベル` のマッピング。Heading1〜3・見出し1〜3を既定で認識。 |
 | `ppr_underline_as_heading` | `true` | 段落デフォルト書式（`w:pPr > w:rPr`）の下線を見出しとして扱う。 |
 | `run_underline_as_heading` | `false` | ランレベル（`w:r > w:rPr`）の下線を見出しとして扱う。Wordの「見出し」スタイルを使わず直接書式で見出しを表現した文書向け。 |
+| `image_max_px` | `0`（無効） | 画像の最大辺長（px）。超過する画像をリサイズし JPEG 再エンコード。`--image-max-px` CLI 引数が優先。 |
+| `image_quality` | `80` | JPEG 再エンコード品質（1〜100）。`image_max_px > 0` のときのみ有効。`--image-quality` CLI 引数が優先。 |
 
 ### 見出し検出の優先順位
 

@@ -18,10 +18,24 @@ pub struct Config {
     /// ppr_underline_as_heading と同時に使う。直接書式設定で見出しを表現する文書向け。
     #[serde(default = "default_true")]
     pub run_underline_as_heading: bool,
+
+    /// 画像の最大辺長（ピクセル）。この値を超える辺がある場合にリサイズする。
+    /// 0 の場合はリサイズ・圧縮を行わない（デフォルト）。
+    #[serde(default)]
+    pub image_max_px: u32,
+
+    /// JPEG 再エンコード時の品質（1〜100）。image_max_px > 0 のときのみ有効。
+    /// デフォルト 80。
+    #[serde(default = "default_image_quality")]
+    pub image_quality: u8,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_image_quality() -> u8 {
+    80
 }
 
 impl Default for Config {
@@ -40,6 +54,8 @@ impl Default for Config {
             heading_styles,
             ppr_underline_as_heading: true,
             run_underline_as_heading: false,  // デフォルトはオフ（誤検出防止）
+            image_max_px: 0,   // デフォルトはリサイズなし
+            image_quality: 80, // JPEG品質デフォルト
         }
     }
 }
