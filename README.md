@@ -26,14 +26,13 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **OMML数式のLaTeX変換** | ✅ | `m:oMath` を検知し `$...$` 形式で埋め込み。分数（`\frac{}`）・上付き（`^{}`）・下付き（`_{}`）・平方根（`\sqrt{}`）を LaTeX に変換。 |
 | **見出し検出の柔軟化** | ✅ | `heading_styles` キーに `"prefix:<str>"` / `"regex:<pattern>"` 記法で前方一致・正規表現マッチを指定可能。 |
 | **進捗表示（CLI）** | ✅ | `indicatif` によるアニメーションプログレスバー。経過時間・処理中ファイル名をリアルタイム表示。完了後に成功/失敗の一覧を出力。 |
+| **XLSXパース本実装** | ✅ | シート名を `heading`、内容をMarkdownテーブルとして `body_text` に格納。Shared Strings・リッチテキスト対応。行数上限（`xlsx_max_rows`）超過時はヘッダーを保持したまま子Sectionに分割。 |
 | **AI連携フォーマッティング** | 🚧 | `--features ai` で有効化。API呼び出しは未実装。 |
-| **XLSXパース** | 🚧 | 構造のみ実装済み、本実装は今後の対応。 |
 
 ## 🗺 ロードマップ（残タスク）
 
 | # | 機能 | 状態 | 概要 |
 | :- | :--- | :---: | :--- |
-| 3 | **XLSXパース本実装** | 🚧 | シート名を `heading`、内容をMarkdownテーブルとして `body_text` に格納。Shared Strings対応 |
 | 9 | **PPTXパース** | 🔲 | スライド単位で `Section` 化。テキストボックスを座標順に結合、スライドノートを補足コンテキストとして抽出 |
 | 10 | **神エクセル対応** | 🔲 | セル結合解決、書式ベースの見出し判定、浮遊テキストボックス抽出 |
 
@@ -89,6 +88,12 @@ cargo run -- --input ./docs --output ./out --image-max-px 1024
 
 # 画像リサイズ + 品質指定
 cargo run -- --input ./docs --output ./out --image-max-px 512 --image-quality 70
+
+# XLSXの大きな表を100行ずつ子Sectionに分割
+cargo run -- --input ./sheets --output ./out --xlsx-max-rows 100
+
+# XLSX分割 + --split 2 でチャンクごとに個別JSONファイルを出力（RAG向け）
+cargo run -- --input ./sheets --output ./out --xlsx-max-rows 100 --split 2
 ```
 
 ## ⚙️ 設定ファイル（`docx2json.json`）
@@ -111,7 +116,8 @@ cargo run -- --input ./docs --output ./out --image-max-px 512 --image-quality 70
   "ppr_underline_as_heading": true,
   "run_underline_as_heading": false,
   "image_max_px": 1024,
-  "image_quality": 80
+  "image_quality": 80,
+  "xlsx_max_rows": 100
 }
 ```
 
@@ -124,6 +130,7 @@ cargo run -- --input ./docs --output ./out --image-max-px 512 --image-quality 70
 | `run_underline_as_heading` | `false` | ランレベル（`w:r > w:rPr`）の下線を見出しとして扱う。Wordの「見出し」スタイルを使わず直接書式で見出しを表現した文書向け。 |
 | `image_max_px` | `0`（無効） | 画像の最大辺長（px）。超過する画像をリサイズし JPEG 再エンコード。`--image-max-px` CLI 引数が優先。 |
 | `image_quality` | `80` | JPEG 再エンコード品質（1〜100）。`image_max_px > 0` のときのみ有効。`--image-quality` CLI 引数が優先。 |
+| `xlsx_max_rows` | `0`（無効） | XLSXシートの最大データ行数。超過した場合ヘッダー行を引き継いだ子Sectionに分割。`--xlsx-max-rows` CLI 引数が優先。 |
 
 ### `heading_styles` キー記法（#12）
 
@@ -185,5 +192,5 @@ src/
 └── parser/
     ├── mod.rs     # ファイル種別ルーティング
     ├── docx.rs    # DOCXパーサー（実装済み）
-    └── xlsx.rs    # XLSXパーサー（スタブ → 実装予定）
+    └── xlsx.rs    # XLSXパーサー（Shared Strings・行チャンク分割対応）
 ```

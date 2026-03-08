@@ -44,6 +44,12 @@ struct Cli {
     /// 省略時は設定ファイルの image_quality（デフォルト 80）を使用。
     #[arg(long, value_name = "QUALITY")]
     image_quality: Option<u8>,
+
+    /// XLSX 1シートあたりの最大データ行数。超過した場合ヘッダーを引き継いだ
+    /// 子 Section に分割する（RAG チャンク化）。省略時は設定ファイルの
+    /// xlsx_max_rows（デフォルト 0 = 制限なし）を使用。
+    #[arg(long, value_name = "ROWS")]
+    xlsx_max_rows: Option<usize>,
 }
 
 fn main() {
@@ -56,9 +62,10 @@ fn main() {
         cli.input.clone()
     };
     let mut cfg = config::Config::load(cli.config.as_deref(), &input_dir);
-    // CLI 引数で画像設定を上書き（設定ファイルより優先）
-    if let Some(px) = cli.image_max_px { cfg.image_max_px = px; }
-    if let Some(q) = cli.image_quality  { cfg.image_quality = q.clamp(1, 100); }
+    // CLI 引数で設定を上書き（設定ファイルより優先）
+    if let Some(px) = cli.image_max_px    { cfg.image_max_px = px; }
+    if let Some(q)  = cli.image_quality   { cfg.image_quality = q.clamp(1, 100); }
+    if let Some(r)  = cli.xlsx_max_rows   { cfg.xlsx_max_rows = r; }
 
     // 出力ディレクトリを作成
     if let Some(ref out) = cli.output {

@@ -36,6 +36,12 @@ pub struct Config {
     #[serde(default = "default_image_quality")]
     pub image_quality: u8,
 
+    /// XLSX 1シートあたりの最大データ行数（ヘッダー行を除く）。
+    /// 超過した場合、ヘッダー行を引き継いだ子 Section に分割する。
+    /// 0 = 制限なし（デフォルト）。`--xlsx-max-rows` CLI 引数が優先。
+    #[serde(default)]
+    pub xlsx_max_rows: usize,
+
     /// ロード時にコンパイル済みのマッチングルール群（serde には含まない）
     #[serde(skip)]
     heading_rules: Vec<HeadingRule>,
@@ -82,6 +88,7 @@ impl Default for Config {
             run_underline_as_heading: false, // デフォルトはオフ（誤検出防止）
             image_max_px: 0,
             image_quality: 80,
+            xlsx_max_rows: 0,
             heading_rules: Vec::new(),
         };
         cfg.heading_rules = compile_heading_rules(&cfg.heading_styles);
