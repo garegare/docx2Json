@@ -361,19 +361,28 @@ fn parse_document_xml(
             // セル終了: テキストを行に追加
             Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
                 if in_table_cell {
-                    current_row.push(current_cell_text.trim().to_string());
+                    // 末尾に残る "<br>"（最終段落の区切り）を除去してから行に追加。
+                    // `trim()` は空白文字のみ除去するため <br> が残ってしまうため、
+                    // 明示的に trim_end_matches で除去する。
+                    let text = current_cell_text
+                        .trim()
+                        .trim_end_matches("<br>")
+                        .trim()
+                        .to_string();
+                    current_row.push(text); // 空セルは rows_to_markdown 側で " " に補填
                     current_cell_text.clear();
                     in_table_cell = false;
                 }
             }
 
             // セル内の段落終了: 複数段落を持つセルの段落間区切り（#2）
-            // Markdown テーブルでは生改行が表の構造を崩すため <br> に変換する
+            // Markdown テーブルでは生改行が表の構造を崩すため <br> に変換する。
+            // セル終了（</tc>）時に末尾の <br> を除去するため、ここでは末尾付与のみ。
             Ok(Event::End(e)) if in_table > 0 && in_table_cell && e.local_name().as_ref() == b"p" => {
                 let trimmed = current_cell_text.trim_end().to_string();
                 if !trimmed.is_empty() {
                     current_cell_text = trimmed;
-                    current_cell_text.push_str("<br>"); // 段落区切りを <br> に変換（tc End で trim）
+                    current_cell_text.push_str("<br>"); // 段落区切りを <br> に変換
                 }
             }
 
@@ -547,6 +556,11 @@ fn parse_document_xml(
                         if body.is_empty() && assets.is_empty() {
                             continue;
                         }
+                        // level=0（"Title" スタイルなど）はセクションとして扱わずスキップ。
+                        // config で level=0 を設定した場合のパニック防止でもある。
+                        if level == 0 {
+                            continue;
+                        }
                         let new_section = Section {
                             context_path: Vec::new(), // fill_context_path() で後から設定
                             heading: body,
@@ -555,10 +569,22 @@ fn parse_document_xml(
                             children: Vec::new(),
                         };
                         // スタックを巻き戻してこのレベルの親を探す（#1 スタック操作）
-                        // 条件: スタックトップのレベル >= 新しいレベル → ポップして親へ移動
-                        // これにより H2→H1、H3→H2 などのレベル逆転も正しく処理される
+                        //
+                        // アルゴリズム:
+                        //   スタックトップのレベル >= 新しいレベル である限りポップして
+                        //   適切な親（次のスタックトップ、なければ root_sections）に追加する。
+                        //
+                        // エッジケースの設計方針:
+                        //   H2 → H1（逆転）: H2 を root に flush してから H1 を push する。
+                        //   H1 → H3（階層スキップ）: H3 を H1 の直下の子として扱う。
+                        //     ファントム H2 は挿入しない（文書に存在しない構造を生成しない）。
+                        //   先頭が H2（H1 なし）: H2 を root_sections に直接追加する。
+                        //
+                        // 安全性: while ループ内の stack.pop() は直前の last() が Some を
+                        //   返したことを確認してから呼ぶため、unwrap() でパニックしない。
                         while stack.last().map_or(false, |(l, _)| *l >= level) {
-                            let (_, finished) = stack.pop().unwrap();
+                            let (_, finished) = stack.pop()
+                                .expect("stack.last() が Some だったため pop は Some を返す");
                             push_to_parent(&mut stack, &mut root_sections, finished);
                         }
                         stack.push((level, new_section));
