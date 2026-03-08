@@ -3,6 +3,7 @@ mod config;
 mod models;
 mod output;
 mod parser;
+mod splitter;
 
 use std::path::PathBuf;
 
@@ -27,6 +28,11 @@ struct Cli {
     /// 設定ファイルのパス（省略時は入力ディレクトリ内の docx2json.json を自動検索）
     #[arg(long)]
     config: Option<PathBuf>,
+
+    /// セクション単位のチャンク分割: 指定した深さ（1 = 最上位）でセクションを分割し
+    /// セクションごとに個別 JSON ファイルを出力する（RAG 向け）
+    #[arg(long, value_name = "LEVEL")]
+    split: Option<usize>,
 }
 
 fn main() {
@@ -64,7 +70,13 @@ fn main() {
             println!("Parsing: {}", path.display());
             let result = parser::parse_file(path, &cfg)
                 .map(|doc| if cli.ai { ai::transform(doc) } else { doc })
-                .and_then(|doc| output::write_json(&doc, path, cli.output.as_deref()));
+                .and_then(|doc| {
+                    if let Some(level) = cli.split {
+                        splitter::write_chunks(&doc, path, cli.output.as_deref(), level)
+                    } else {
+                        output::write_json(&doc, path, cli.output.as_deref())
+                    }
+                });
             (path, result)
         })
         .collect();
