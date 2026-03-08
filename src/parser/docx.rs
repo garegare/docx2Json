@@ -33,10 +33,13 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     let images = extract_images(&mut archive, &rels)
         .context("画像の抽出に失敗")?;
 
+    // numbering.xml から箇条書き定義を取得（存在しない場合は空マップ）
+    let numbering = parse_numbering(&mut archive);
+
     // document.xml をパース
     let xml = read_zip_entry(&mut archive, "word/document.xml")
         .context("word/document.xml の読み込みに失敗")?;
-    let sections = parse_document_xml(&xml, &images, config)
+    let sections = parse_document_xml(&xml, &images, &numbering, config)
         .context("document.xml のパースに失敗")?;
 
     Ok(Document { title, sections })
@@ -89,8 +92,101 @@ fn extract_images(
     Ok(images)
 }
 
+/// word/numbering.xml を解析し、numId → Vec<numFmt> のマップを返す
+/// ilvl(0-8) ごとの numFmt 文字列（"bullet", "decimal", "lowerLetter" など）を保持する
+/// numbering.xml が存在しない場合は空マップを返す（エラーは無視）
+fn parse_numbering(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> HashMap<String, Vec<String>> {
+    let xml = match read_zip_entry(archive, "word/numbering.xml") {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+
+    // abstractNumId → [numFmt at ilvl 0..8]
+    let mut abstract_fmts: HashMap<String, Vec<String>> = HashMap::new();
+    // numId → abstractNumId
+    let mut num_to_abstract: HashMap<String, String> = HashMap::new();
+
+    let mut current_abstract_id: Option<String> = None; // abstractNum 処理中
+    let mut current_num_id: Option<String> = None;      // num 処理中
+    let mut current_ilvl: Option<usize> = None;         // lvl 処理中
+
+    let mut reader = Reader::from_str(&xml);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event() {
+            // <w:abstractNum w:abstractNumId="0">
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"abstractNum" => {
+                if let Some(id) = attr_value(&e, "abstractNumId") {
+                    abstract_fmts
+                        .entry(id.clone())
+                        .or_insert_with(|| vec!["bullet".to_string(); 9]);
+                    current_abstract_id = Some(id);
+                }
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"abstractNum" => {
+                current_abstract_id = None;
+            }
+
+            // <w:lvl w:ilvl="0">
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"lvl" => {
+                current_ilvl = attr_value(&e, "ilvl").and_then(|s| s.parse().ok());
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"lvl" => {
+                current_ilvl = None;
+            }
+
+            // <w:numFmt w:val="bullet"/>
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"numFmt" => {
+                if let (Some(ref abs_id), Some(ilvl)) = (&current_abstract_id, current_ilvl) {
+                    if let Some(fmt) = attr_value(&e, "val") {
+                        if let Some(fmts) = abstract_fmts.get_mut(abs_id) {
+                            if ilvl < fmts.len() {
+                                fmts[ilvl] = fmt;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // <w:num w:numId="1">
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"num" => {
+                current_num_id = attr_value(&e, "numId");
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"num" => {
+                current_num_id = None;
+            }
+
+            // <w:abstractNumId w:val="0"/>（num の子要素）
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if current_num_id.is_some() && e.local_name().as_ref() == b"abstractNumId" =>
+            {
+                if let (Some(ref num_id), Some(abs_id)) = (&current_num_id, attr_value(&e, "val")) {
+                    num_to_abstract.insert(num_id.clone(), abs_id);
+                }
+            }
+
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // numId → fmts に解決して返す
+    num_to_abstract
+        .into_iter()
+        .filter_map(|(num_id, abs_id)| {
+            abstract_fmts.get(&abs_id).map(|fmts| (num_id, fmts.clone()))
+        })
+        .collect()
+}
+
 /// document.xml を走査しセクションツリーを構築する
-fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Config) -> Result<Vec<Section>> {
+fn parse_document_xml(
+    xml: &str,
+    images: &HashMap<String, String>,
+    numbering: &HashMap<String, Vec<String>>,
+    config: &Config,
+) -> Result<Vec<Section>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -108,6 +204,11 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
     let mut drawing_title: Option<String> = None;   // 処理中の drawing のタイトル（wp:docPr から取得）
     let mut in_paragraph = false;
     let mut paragraph_style: Option<String> = None;
+
+    // ---- 箇条書きパーサー状態 ----
+    let mut in_numpr = false;                    // w:numPr 内か
+    let mut para_num_id: Option<String> = None;  // 現在の段落の numId
+    let mut para_num_ilvl: u32 = 0;              // 現在の段落の ilvl（インデントレベル）
 
     // ---- テーブルパーサー状態 ----
     let mut in_table: u32 = 0;                      // w:tbl ネスト深さ
@@ -194,6 +295,9 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                 paragraph_style = None;
                 ppr_underline = false;
                 run_underline = false;
+                in_numpr = false;
+                para_num_id = None;
+                para_num_ilvl = 0;
                 current_text.clear();
                 current_assets.clear();
             }
@@ -205,11 +309,35 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
             Ok(Event::End(e)) if e.local_name().as_ref() == b"pPr" => {
                 in_ppr = false;
                 in_ppr_rpr = false;
+                in_numpr = false;
             }
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"pStyle" => {
                 if let Some(val) = attr_value(&e, "w:val").or_else(|| attr_value(&e, "val")) {
                     paragraph_style = Some(val);
                 }
+            }
+
+            // ---- 箇条書き番号参照（w:numPr）----
+            // <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
+            Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"numPr" => {
+                in_numpr = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"numPr" => {
+                in_numpr = false;
+            }
+            // ilvl: インデントレベル（0 = 最上位、1 = 1段インデント、…）
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_numpr && e.local_name().as_ref() == b"ilvl" =>
+            {
+                if let Some(val) = attr_value(&e, "val") {
+                    para_num_ilvl = val.parse().unwrap_or(0);
+                }
+            }
+            // numId: 箇条書き定義の参照 ID（0 はリストなしを意味するためスキップ）
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_numpr && e.local_name().as_ref() == b"numId" =>
+            {
+                para_num_id = attr_value(&e, "val").filter(|s| s != "0");
             }
 
             // ---- ランプロパティ ----
@@ -300,6 +428,8 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                     let style = paragraph_style.take();
                     let ppr_ul = std::mem::replace(&mut ppr_underline, false);
                     let run_ul = std::mem::replace(&mut run_underline, false);
+                    let num_id = para_num_id.take();
+                    let num_ilvl = para_num_ilvl;
 
                     let heading_level = style.as_deref()
                         .and_then(|s| config.heading_level_for_style(s))
@@ -333,7 +463,25 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
                         }
                         stack.push((level, new_section));
                     } else if !body.is_empty() || !assets.is_empty() {
-                        // 通常段落: 現在のセクションの body_text に追加
+                        // 箇条書きプレフィックスを付与（numId が設定されている場合）
+                        let body = if let Some(ref nid) = num_id {
+                            let indent = "  ".repeat(num_ilvl as usize);
+                            let ordered = numbering
+                                .get(nid)
+                                .and_then(|fmts| fmts.get(num_ilvl as usize))
+                                .map(|fmt| is_ordered_numfmt(fmt))
+                                .unwrap_or(false);
+                            let prefix = if ordered {
+                                format!("{}1. ", indent)
+                            } else {
+                                format!("{}- ", indent)
+                            };
+                            format!("{}{}", prefix, body)
+                        } else {
+                            body
+                        };
+
+                        // 現在のセクションの body_text に追加
                         if let Some((_, sec)) = stack.last_mut() {
                             if !sec.body_text.is_empty() {
                                 sec.body_text.push('\n');
@@ -389,6 +537,23 @@ fn rows_to_markdown(rows: &[Vec<String>]) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// numFmt 値が番号付きリスト（ordered list）かどうかを判定する
+/// "decimal", "lowerLetter" などは番号付き、"bullet" などは箇条書き
+fn is_ordered_numfmt(fmt: &str) -> bool {
+    matches!(
+        fmt,
+        "decimal"
+            | "decimalZero"
+            | "lowerLetter"
+            | "upperLetter"
+            | "lowerRoman"
+            | "upperRoman"
+            | "ordinal"
+            | "cardinalText"
+            | "ordinalText"
+    )
 }
 
 /// セクションを適切な親に追加する
