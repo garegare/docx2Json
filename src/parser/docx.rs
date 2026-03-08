@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
+use anyhow::{Context, Result};
 use base64::Engine;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -10,12 +11,12 @@ use zip::ZipArchive;
 use crate::config::Config;
 use crate::models::{Asset, Document, Section};
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
 /// DOCXファイルを解析してDocumentを返す
-pub fn parse(path: &Path, config: &Config) -> Result<Document, Error> {
-    let file = std::fs::File::open(path)?;
-    let mut archive = ZipArchive::new(BufReader::new(file))?;
+pub fn parse(path: &Path, config: &Config) -> Result<Document> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("ファイルを開けません: {}", path.display()))?;
+    let mut archive = ZipArchive::new(BufReader::new(file))
+        .context("ZIPアーカイブとして開けません（破損または非DOCXファイルの可能性）")?;
 
     // ファイル名をタイトルとして使用
     let title = path
@@ -25,23 +26,27 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document, Error> {
         .to_string();
 
     // relationships を読み込んで画像パスを解決
-    let rels = parse_rels(&mut archive)?;
+    let rels = parse_rels(&mut archive)
+        .context("リレーションシップファイルのパースに失敗")?;
 
     // 画像データをBase64で取得
-    let images = extract_images(&mut archive, &rels)?;
+    let images = extract_images(&mut archive, &rels)
+        .context("画像の抽出に失敗")?;
 
     // document.xml をパース
-    let xml = read_zip_entry(&mut archive, "word/document.xml")?;
-    let sections = parse_document_xml(&xml, &images, config)?;
+    let xml = read_zip_entry(&mut archive, "word/document.xml")
+        .context("word/document.xml の読み込みに失敗")?;
+    let sections = parse_document_xml(&xml, &images, config)
+        .context("document.xml のパースに失敗")?;
 
     Ok(Document { title, sections })
 }
 
 /// word/_rels/document.xml.rels を解析し、rId -> パスのマップを返す
-fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<HashMap<String, String>, Error> {
+fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<HashMap<String, String>> {
     let xml = match read_zip_entry(archive, "word/_rels/document.xml.rels") {
         Ok(s) => s,
-        Err(_) => return Ok(HashMap::new()),
+        Err(_) => return Ok(HashMap::new()), // rels ファイルがない場合は空マップを返す
     };
 
     let mut rels = HashMap::new();
@@ -60,7 +65,7 @@ fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<Hash
                 }
             }
             Ok(Event::Eof) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(anyhow::Error::from(e)),
             _ => {}
         }
     }
@@ -71,7 +76,7 @@ fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<Hash
 fn extract_images(
     archive: &mut ZipArchive<BufReader<std::fs::File>>,
     rels: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, Error> {
+) -> Result<HashMap<String, String>> {
     let mut images = HashMap::new();
     for (rid, zip_path) in rels {
         if let Ok(mut entry) = archive.by_name(zip_path) {
@@ -85,7 +90,7 @@ fn extract_images(
 }
 
 /// document.xml を走査しセクションツリーを構築する
-fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Config) -> Result<Vec<Section>, Error> {
+fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Config) -> Result<Vec<Section>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
 
@@ -329,7 +334,8 @@ fn parse_document_xml(xml: &str, images: &HashMap<String, String>, config: &Conf
             }
 
             Ok(Event::Eof) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(anyhow::Error::from(e)
+                .context("document.xml のXML読み取り中にエラーが発生")),
             _ => {}
         }
     }
@@ -402,9 +408,11 @@ fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
 fn read_zip_entry(
     archive: &mut ZipArchive<BufReader<std::fs::File>>,
     name: &str,
-) -> Result<String, Error> {
-    let mut entry = archive.by_name(name)?;
+) -> Result<String> {
+    let mut entry = archive.by_name(name)
+        .with_context(|| format!("ZIPエントリが見つかりません: {}", name))?;
     let mut buf = String::new();
-    entry.read_to_string(&mut buf)?;
+    entry.read_to_string(&mut buf)
+        .with_context(|| format!("ZIPエントリの読み込みに失敗: {}", name))?;
     Ok(buf)
 }

@@ -1,10 +1,11 @@
 use std::path::Path;
+
+use anyhow::Result;
+
 use crate::models::{Document, Section};
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-
 /// XLSXファイルを解析してDocumentを返す（現在はスタブ実装）
-pub fn parse(path: &Path) -> Result<Document, Error> {
+pub fn parse(path: &Path) -> Result<Document> {
     let title = path
         .file_stem()
         .and_then(|s| s.to_str())

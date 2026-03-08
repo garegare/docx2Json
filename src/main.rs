@@ -74,7 +74,11 @@ fn main() {
     println!("\nDone: {} succeeded, {} failed.", ok.len(), err.len());
     for (path, e) in err.iter() {
         if let Err(e) = e {
-            eprintln!("  FAILED {}: {}", path.display(), e);
+            eprintln!("  FAILED {}", path.display());
+            // anyhow のエラーチェーンを階層表示
+            for (i, cause) in e.chain().enumerate() {
+                eprintln!("    {}{}", "  ".repeat(i), cause);
+            }
         }
     }
 }
