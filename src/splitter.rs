@@ -63,7 +63,7 @@ pub fn write_chunks(
             .context("チャンクのJSONシリアライズに失敗")?;
         std::fs::write(&out_path, &json)
             .with_context(|| format!("チャンクファイルへの書き込みに失敗: {}", out_path.display()))?;
-        println!("  -> {} ({}/{})", out_path.display(), i + 1, total);
+        // 出力先の表示は main.rs の結果サマリーで一括表示するため ここでは省略
     }
 
     Ok(())
