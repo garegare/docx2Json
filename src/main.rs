@@ -8,6 +8,7 @@ mod splitter;
 use std::path::PathBuf;
 
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 #[derive(Parser)]
@@ -74,13 +75,30 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("Processing {} file(s)...", files.len());
+    // ---- プログレスバーを初期化（#13）----
+    // indicatif により「処理済み / 合計」と現在処理中ファイル名をリアルタイム表示する。
+    // rayon の並列処理とは pb.inc()/set_message() がスレッドセーフに動作するため共用可能。
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.cyan} [{elapsed_precise}] [{bar:35.green/white}] {pos}/{len}  {wide_msg}",
+        )
+        .unwrap_or_else(|_| ProgressStyle::default_bar())
+        .progress_chars("█▓░"),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Rayon で並列処理
     let results: Vec<_> = files
         .par_iter()
         .map(|path| {
-            println!("Parsing: {}", path.display());
+            // 現在処理中のファイル名をプログレスバーに表示
+            let filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            pb.set_message(filename);
+
             let result = parser::parse_file(path, &cfg)
                 .map(|doc| if cli.ai { ai::transform(doc) } else { doc })
                 .and_then(|doc| {
@@ -90,21 +108,58 @@ fn main() {
                         output::write_json(&doc, path, cli.output.as_deref())
                     }
                 });
+
+            pb.inc(1);
             (path, result)
         })
         .collect();
 
-    // 結果サマリー
+    pb.finish_and_clear();
+
+    // ---- 結果サマリーを表示（#13 + 既存機能）----
     let (ok, err): (Vec<_>, Vec<_>) = results.iter().partition(|(_, r)| r.is_ok());
-    println!("\nDone: {} succeeded, {} failed.", ok.len(), err.len());
+
+    // 成功ファイルの出力先を一覧表示
+    for (path, _) in ok.iter() {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
+        let out_path = if let Some(ref dir) = cli.output {
+            dir.join(format!("{}.json", stem)).display().to_string()
+        } else {
+            path.with_extension("json").display().to_string()
+        };
+        println!("  ✓ {}", out_path);
+    }
+
+    println!(
+        "\n完了: {} 件成功, {} 件失敗  (経過 {})",
+        ok.len(),
+        err.len(),
+        format_elapsed(pb.elapsed()),
+    );
+
+    // 失敗ファイルのエラー詳細
     for (path, e) in err.iter() {
         if let Err(e) = e {
-            eprintln!("  FAILED {}", path.display());
-            // anyhow のエラーチェーンを階層表示
+            eprintln!("\n  ✗ FAILED: {}", path.display());
             for (i, cause) in e.chain().enumerate() {
                 eprintln!("    {}{}", "  ".repeat(i), cause);
             }
         }
+    }
+
+    // 1件でも失敗があれば非ゼロ終了コード
+    if !err.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+/// 経過時間を人間が読みやすい形式に変換する（例: "1m23s", "45s"）
+fn format_elapsed(dur: std::time::Duration) -> String {
+    let secs = dur.as_secs();
+    if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}.{:02}s", secs, dur.subsec_millis() / 10)
     }
 }
 

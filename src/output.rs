@@ -22,6 +22,6 @@ pub fn write_json(doc: &Document, input_path: &Path, output_dir: Option<&Path>) 
         .context("JSONシリアライズに失敗")?;
     std::fs::write(&out_path, &json)
         .with_context(|| format!("ファイルへの書き込みに失敗: {}", out_path.display()))?;
-    println!("  -> {}", out_path.display());
+    // 出力先の表示は main.rs の結果サマリーで一括表示するため ここでは省略
     Ok(())
 }
