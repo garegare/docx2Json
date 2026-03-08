@@ -17,6 +17,7 @@ pub fn parse(path: &Path) -> Result<Document> {
     // 2. xl/worksheets/sheet*.xml を走査してセル値を取得
     // 3. 各シートを Section として構造化
     let section = Section {
+        context_path: Vec::new(), // fill_context_path() で後から設定
         heading: format!("(XLSX stub: {})", title),
         body_text: "XLSXパーサーは未実装です。".to_string(),
         assets: Vec::new(),

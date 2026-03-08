@@ -451,6 +451,7 @@ fn parse_document_xml(
                             continue;
                         }
                         let new_section = Section {
+                            context_path: Vec::new(), // fill_context_path() で後から設定
                             heading: body,
                             body_text: String::new(),
                             assets,
