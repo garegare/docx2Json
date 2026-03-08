@@ -41,14 +41,17 @@ fn default_image_quality() -> u8 {
 impl Default for Config {
     fn default() -> Self {
         // デフォルト: 標準的な英語・日本語スタイル名
+        // スタイル名は normalize_style_name() で正規化して格納する（#5）
         let mut heading_styles = HashMap::new();
         for (name, level) in [
             ("Heading1", 1usize), ("Heading2", 2), ("Heading3", 3),
             ("heading1", 1), ("heading2", 2), ("heading3", 3),
             ("見出し1", 1), ("見出し2", 2), ("見出し3", 3),
+            // 全角数字バリアント（例: 「見出し１」→ 正規化で「見出し1」に統合済み）
+            ("見出し１", 1), ("見出し２", 2), ("見出し３", 3),
             ("1", 1), ("2", 2), ("3", 3),  // 数値IDスタイル
         ] {
-            heading_styles.insert(name.to_string(), level);
+            heading_styles.insert(normalize_style_name(name), level);
         }
         Self {
             heading_styles,
@@ -62,12 +65,22 @@ impl Default for Config {
 
 impl Config {
     /// 設定ファイルを探して読み込む。見つからない場合はデフォルトを返す。
-    /// 探索順: `--config` で指定されたパス → 入力ディレクトリ内の docx2json.json
+    ///
+    /// 探索順（#5 暗黙的ロード対応）:
+    ///   1. `--config` で指定されたパス
+    ///   2. 入力ディレクトリ内の `docx2json.json`
+    ///   3. カレントディレクトリの `docx2json.json`
+    ///   4. 実行バイナリと同じディレクトリの `docx2json.json`
     pub fn load(config_path: Option<&Path>, input_dir: &Path) -> Self {
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("docx2json.json")));
+
         let candidates = [
             config_path.map(|p| p.to_path_buf()),
             Some(input_dir.join("docx2json.json")),
             Some(std::env::current_dir().unwrap_or_default().join("docx2json.json")),
+            exe_dir,
         ];
 
         for path in candidates.iter().flatten() {
@@ -76,7 +89,15 @@ impl Config {
                     Ok(content) => match serde_json::from_str::<Config>(&content) {
                         Ok(cfg) => {
                             eprintln!("Config loaded: {}", path.display());
-                            return cfg;
+                            // heading_styles のキーを正規化して返す（#5）
+                            let normalized_styles = cfg.heading_styles
+                                .into_iter()
+                                .map(|(k, v)| (normalize_style_name(&k), v))
+                                .collect();
+                            return Config {
+                                heading_styles: normalized_styles,
+                                ..cfg
+                            };
                         }
                         Err(e) => {
                             eprintln!("Warning: failed to parse config {}: {}", path.display(), e);
@@ -89,8 +110,30 @@ impl Config {
         Config::default()
     }
 
-    /// スタイル名からレベルを返す
+    /// スタイル名からレベルを返す（#5 正規化マッチング）
+    ///
+    /// DOCX に記録されるスタイル名は環境によって全角・半角が混在する場合がある。
+    /// 例: 「見出し１」と「見出し1」は同一スタイルとして扱う。
     pub fn heading_level_for_style(&self, style: &str) -> Option<usize> {
-        self.heading_styles.get(style).copied()
+        let normalized = normalize_style_name(style);
+        self.heading_styles.get(&normalized).copied()
     }
+}
+
+/// スタイル名を正規化する（#5 全角・半角の揺れを吸収）
+///
+/// 全角英数字（ＡＢＣ、０１２ など）を半角（ABC, 012 など）に変換する。
+/// これにより「見出し１」「見出し1」などの表記揺れを統一して検索できる。
+pub fn normalize_style_name(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            // 全角数字 → 半角数字
+            '０'..='９' => char::from_u32(c as u32 - '０' as u32 + '0' as u32).unwrap_or(c),
+            // 全角大文字英字 → 半角大文字
+            'Ａ'..='Ｚ' => char::from_u32(c as u32 - 'Ａ' as u32 + 'A' as u32).unwrap_or(c),
+            // 全角小文字英字 → 半角小文字
+            'ａ'..='ｚ' => char::from_u32(c as u32 - 'ａ' as u32 + 'a' as u32).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
 }

@@ -3,7 +3,6 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use image::codecs::jpeg::JpegEncoder;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -30,7 +29,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     let rels = parse_rels(&mut archive)
         .context("リレーションシップファイルのパースに失敗")?;
 
-    // 画像データをBase64で取得
+    // 画像データをバイナリで取得（Base64 エンコードは出力直前まで遅延）
     let images = extract_images(&mut archive, &rels, config)
         .context("画像の抽出に失敗")?;
 
@@ -76,13 +75,18 @@ fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<Hash
     Ok(rels)
 }
 
-/// ZIP内の画像ファイルをBase64エンコードして返す
-/// config.image_max_px > 0 の場合、長辺をその値に収まるようリサイズし JPEG 再エンコードする
+/// ZIP内の画像ファイルをバイナリとして返す（#4 Lazy Serialization）
+///
+/// Base64 エンコードはここでは行わず、`Asset.data: Vec<u8>` として保持する。
+/// JSON 出力時に `models::serialize_as_base64` が呼ばれるため、メモリ上の
+/// データ量を元サイズ（Base64比 約75%）に抑えられる。
+///
+/// config.image_max_px > 0 の場合は長辺をリサイズして JPEG 再エンコードする。
 fn extract_images(
     archive: &mut ZipArchive<BufReader<std::fs::File>>,
     rels: &HashMap<String, String>,
     config: &Config,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, Vec<u8>>> {
     let mut images = HashMap::new();
     for (rid, zip_path) in rels {
         if let Ok(mut entry) = archive.by_name(zip_path) {
@@ -97,8 +101,7 @@ fn extract_images(
                 buf
             };
 
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&final_buf);
-            images.insert(rid.clone(), encoded);
+            images.insert(rid.clone(), final_buf); // Vec<u8> のまま格納
         }
     }
     Ok(images)
@@ -218,7 +221,7 @@ fn parse_numbering(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> HashMa
 /// document.xml を走査しセクションツリーを構築する
 fn parse_document_xml(
     xml: &str,
-    images: &HashMap<String, String>,
+    images: &HashMap<String, Vec<u8>>,
     numbering: &HashMap<String, Vec<String>>,
     config: &Config,
 ) -> Result<Vec<Section>> {
@@ -252,13 +255,66 @@ fn parse_document_xml(
     let mut current_row: Vec<String> = Vec::new();  // 現在の行のセル
     let mut table_rows: Vec<Vec<String>> = Vec::new(); // テーブル全行
 
+    // ---- OMML（数式）パーサー状態 ----
+    // Office Math Markup Language (OMML) を LaTeX ライクな表記に変換する。
+    // SAX スタイルパーサーで再帰構造を扱うため、(要素名, 出力バッファ) の
+    // スタックを用いてボトムアップに LaTeX テキストを組み立てる。
+    let mut in_omath: u32 = 0;                           // m:oMath ネスト深さ
+    let mut omath_stack: Vec<(String, String)> = Vec::new(); // (タグ名, 出力バッファ)
+    let mut in_mt = false;                               // m:t（数式テキスト）内か
+
     // ---- セクションスタック ----
     // (level, section) のスタック。ルートの children が最終出力。
+    //
+    // # スタック操作の設計（#1 エッジケース対応）
+    // 新しい見出しレベル N が来たとき:
+    //   1. スタックトップのレベル >= N である限り pop し、適切な親に push する
+    //   2. 残ったスタックトップがこの見出しの親になる（いなければ root_sections）
+    //
+    // エッジケース例:
+    //   H1 → H3（H2 スキップ）: H3 は H1 の子として扱う（スタックは空にならない）
+    //   H2 → H1（レベル逆転）: H2 を root に flush してから H1 を push する
+    //   先頭が H2（H1 なし）: H2 は直接 root_sections に入る
     let mut stack: Vec<(usize, Section)> = Vec::new();
     let mut root_sections: Vec<Section> = Vec::new();
 
     loop {
         match reader.read_event() {
+
+            // ================================================================
+            // OMML 数式処理（m:oMath > m:f / m:sSup / m:sSub / m:t など）
+            // ================================================================
+
+            // oMath 開始: 数式モードに入る（ネスト対応）
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"oMath" => {
+                in_omath += 1;
+                omath_stack.push(("oMath".to_string(), String::new()));
+            }
+
+            // 数式モード内のすべての開始タグ: スタックに積む
+            Ok(Event::Start(e)) if in_omath > 0 => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if local == "t" { in_mt = true; }
+                omath_stack.push((local, String::new()));
+            }
+
+            // 数式モード内のすべての終了タグ: ポップしてバッファを親に結合
+            Ok(Event::End(e)) if in_omath > 0 => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).to_string();
+                if local == "t" { in_mt = false; }
+                if local == "oMath" {
+                    // 数式モード終了: LaTeX 文字列を生成して段落に追加
+                    if let Some((_, latex_buf)) = omath_stack.pop() {
+                        let latex = format!("${}$", latex_buf.trim());
+                        if in_paragraph && in_table == 0 && !latex.is_empty() {
+                            current_text.push_str(&latex);
+                        }
+                    }
+                    if in_omath > 0 { in_omath -= 1; }
+                } else {
+                    omath_pop_and_combine(&mut omath_stack, &local);
+                }
+            }
 
             // ================================================================
             // テーブル処理（w:tbl > w:tr > w:tc）
@@ -305,18 +361,28 @@ fn parse_document_xml(
             // セル終了: テキストを行に追加
             Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
                 if in_table_cell {
-                    current_row.push(current_cell_text.trim().to_string());
+                    // 末尾に残る "<br>"（最終段落の区切り）を除去してから行に追加。
+                    // `trim()` は空白文字のみ除去するため <br> が残ってしまうため、
+                    // 明示的に trim_end_matches で除去する。
+                    let text = current_cell_text
+                        .trim()
+                        .trim_end_matches("<br>")
+                        .trim()
+                        .to_string();
+                    current_row.push(text); // 空セルは rows_to_markdown 側で " " に補填
                     current_cell_text.clear();
                     in_table_cell = false;
                 }
             }
 
-            // セル内の段落終了: 複数段落を持つセルの段落間区切り
+            // セル内の段落終了: 複数段落を持つセルの段落間区切り（#2）
+            // Markdown テーブルでは生改行が表の構造を崩すため <br> に変換する。
+            // セル終了（</tc>）時に末尾の <br> を除去するため、ここでは末尾付与のみ。
             Ok(Event::End(e)) if in_table > 0 && in_table_cell && e.local_name().as_ref() == b"p" => {
                 let trimmed = current_cell_text.trim_end().to_string();
                 if !trimmed.is_empty() {
                     current_cell_text = trimmed;
-                    current_cell_text.push(' '); // 段落間スペース（tc End で trim される）
+                    current_cell_text.push_str("<br>"); // 段落区切りを <br> に変換
                 }
             }
 
@@ -435,12 +501,27 @@ fn parse_document_xml(
                 // drawing 終了時に rId と title をまとめて Asset 化
                 let title = drawing_title.take().unwrap_or_default();
                 if let Some(rid) = drawing_rid.take() {
-                    if let Some(b64) = images.get(&rid) {
+                    if let Some(raw) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
                             title,
-                            data: b64.clone(),
+                            data: raw.clone(), // Vec<u8>: Base64 エンコードは出力時に実施
                         });
+                    }
+                }
+            }
+
+            // ---- ソフト改行（w:br）----
+            // <w:br/> または <w:br w:type="textWrapping"/> はラン内の強制改行。
+            // ページ区切り（w:type="page"）や段区切り（"column"）はテキストに含めない。
+            // セル内では <br> に、段落内では \n に変換する。
+            Ok(Event::Empty(e)) if in_del == 0 && e.local_name().as_ref() == b"br" => {
+                let br_type = attr_value(&e, "type").unwrap_or_default();
+                if br_type != "page" && br_type != "column" {
+                    if in_table == 1 && in_table_cell {
+                        current_cell_text.push_str("<br>");
+                    } else if in_paragraph {
+                        current_text.push('\n');
                     }
                 }
             }
@@ -448,7 +529,12 @@ fn parse_document_xml(
             // ---- テキストノード ----
             Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr => {
                 let text = e.unescape().unwrap_or_default();
-                if in_table == 1 && in_table_cell {
+                if in_omath > 0 && in_mt {
+                    // 数式テキスト: omath_stack のトップバッファに追記
+                    if let Some((_, buf)) = omath_stack.last_mut() {
+                        buf.push_str(&text);
+                    }
+                } else if in_table == 1 && in_table_cell {
                     // テーブルセルのテキスト
                     current_cell_text.push_str(&text);
                 } else if in_paragraph {
@@ -485,6 +571,11 @@ fn parse_document_xml(
                         if body.is_empty() && assets.is_empty() {
                             continue;
                         }
+                        // level=0（"Title" スタイルなど）はセクションとして扱わずスキップ。
+                        // config で level=0 を設定した場合のパニック防止でもある。
+                        if level == 0 {
+                            continue;
+                        }
                         let new_section = Section {
                             context_path: Vec::new(), // fill_context_path() で後から設定
                             heading: body,
@@ -492,9 +583,23 @@ fn parse_document_xml(
                             assets,
                             children: Vec::new(),
                         };
-                        // スタックを巻き戻してこのレベルの親を探す
+                        // スタックを巻き戻してこのレベルの親を探す（#1 スタック操作）
+                        //
+                        // アルゴリズム:
+                        //   スタックトップのレベル >= 新しいレベル である限りポップして
+                        //   適切な親（次のスタックトップ、なければ root_sections）に追加する。
+                        //
+                        // エッジケースの設計方針:
+                        //   H2 → H1（逆転）: H2 を root に flush してから H1 を push する。
+                        //   H1 → H3（階層スキップ）: H3 を H1 の直下の子として扱う。
+                        //     ファントム H2 は挿入しない（文書に存在しない構造を生成しない）。
+                        //   先頭が H2（H1 なし）: H2 を root_sections に直接追加する。
+                        //
+                        // 安全性: while ループ内の stack.pop() は直前の last() が Some を
+                        //   返したことを確認してから呼ぶため、unwrap() でパニックしない。
                         while stack.last().map_or(false, |(l, _)| *l >= level) {
-                            let (_, finished) = stack.pop().unwrap();
+                            let (_, finished) = stack.pop()
+                                .expect("stack.last() が Some だったため pop は Some を返す");
                             push_to_parent(&mut stack, &mut root_sections, finished);
                         }
                         stack.push((level, new_section));
@@ -544,8 +649,67 @@ fn parse_document_xml(
     Ok(root_sections)
 }
 
-/// テーブルの行データをMarkdown形式に変換する
-/// 最初の行をヘッダーとして扱い、その後にセパレーター行を挿入する
+/// OMML スタックのトップをポップし、親バッファに LaTeX として結合する（#3）
+///
+/// # 変換ルール
+/// | 親タグ  | 子タグ | 出力                          |
+/// |---------|--------|-------------------------------|
+/// | `f`     | `num`  | `\frac{<num>}{` (分子)        |
+/// | `f`     | `den`  | `<den>}` (分母+閉じ)          |
+/// | `sSup`  | `e`    | `<base>^{` (基数+上付き開き)  |
+/// | `sSup`  | `sup`  | `<exp>}` (指数+閉じ)          |
+/// | `sSub`  | `e`    | `<base>_{` (基数+下付き開き)  |
+/// | `sSub`  | `sub`  | `<sub>}` (添字+閉じ)          |
+/// | `rad`   | `e`    | `\sqrt{<radicand>}` (平方根)  |
+/// | その他  | 任意   | バッファをそのまま連結        |
+fn omath_pop_and_combine(stack: &mut Vec<(String, String)>, child_tag: &str) {
+    if let Some((_, child_buf)) = stack.pop() {
+        if let Some((parent_tag, parent_buf)) = stack.last_mut() {
+            match (parent_tag.as_str(), child_tag) {
+                ("f", "num") => {
+                    parent_buf.push_str("\\frac{");
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push_str("}{");
+                }
+                ("f", "den") => {
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push('}');
+                }
+                ("sSup", "e") => {
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push_str("^{");
+                }
+                ("sSup", "sup") => {
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push('}');
+                }
+                ("sSub", "e") => {
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push_str("_{");
+                }
+                ("sSub", "sub") => {
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push('}');
+                }
+                ("rad", "e") => {
+                    parent_buf.push_str("\\sqrt{");
+                    parent_buf.push_str(&child_buf);
+                    parent_buf.push('}');
+                }
+                // deg（√の次数）や nary（総和記号 Σ など）は現状テキストを連結
+                _ => {
+                    parent_buf.push_str(&child_buf);
+                }
+            }
+        }
+    }
+}
+
+/// テーブルの行データをMarkdown形式に変換する（#2 テーブル Markdown 適合）
+///
+/// - 最初の行をヘッダーとして扱い、その後にセパレーター行を挿入する
+/// - セル内の `\n` は `<br>` に変換済み（セル段落終了ハンドラで処理）
+/// - 空セルは ` ` (スペース) で埋めて列ズレを防止する
 fn rows_to_markdown(rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return String::new();
@@ -560,9 +724,11 @@ fn rows_to_markdown(rows: &[Vec<String>]) -> String {
         // 不足列を空文字で埋め、パイプ文字をエスケープ
         let cells: Vec<String> = (0..cols)
             .map(|j| {
-                row.get(j)
+                let cell = row.get(j)
                     .map(|c| c.replace('|', r"\|"))
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                // 空セルは " " に置換して列のズレを防止
+                if cell.is_empty() { " ".to_string() } else { cell }
             })
             .collect();
         lines.push(format!("| {} |", cells.join(" | ")));
