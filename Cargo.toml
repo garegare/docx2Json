@@ -8,6 +8,7 @@ name = "docx2json"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
 zip = "2"
 quick-xml = "0.37"
 serde = { version = "1", features = ["derive"] }
