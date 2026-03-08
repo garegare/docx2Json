@@ -3,12 +3,18 @@
     "Heading1": 1,
     "Heading2": 2,
     "Heading3": 3,
+    "heading 1": 1,
+    "heading 2": 2,
+    "heading 3": 3,
     "heading1": 1,
     "heading2": 2,
     "heading3": 3,
     "見出し1": 1,
     "見出し2": 2,
-    "見出し3": 3
+    "見出し3": 3,
+    "1": 1,
+    "2": 2,
+    "3": 3
   },
   "ppr_underline_as_heading": true,
   "run_underline_as_heading": true
