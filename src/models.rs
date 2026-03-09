@@ -15,7 +15,7 @@ pub struct SectionMetadata {
     pub ai_tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Section {
     /// 文書タイトル + context_path を連結した文字列の FNV-1a 16進数ハッシュ。
     /// 実行間で安定した ID として使用する（追加クレート不要）。
@@ -34,19 +34,6 @@ pub struct Section {
     pub metadata: SectionMetadata,
 }
 
-impl Default for Section {
-    fn default() -> Self {
-        Section {
-            id: String::new(),
-            context_path: Vec::new(),
-            heading: String::new(),
-            body_text: String::new(),
-            assets: Vec::new(),
-            children: Vec::new(),
-            metadata: SectionMetadata::default(),
-        }
-    }
-}
 
 /// 画像等のバイナリアセット。
 /// 内部では `Vec<u8>` として保持し、JSON 出力時にのみ Base64 エンコードする

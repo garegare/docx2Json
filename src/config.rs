@@ -158,8 +158,8 @@ impl Config {
 
         for path in candidates.iter().flatten() {
             if path.exists() {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => match serde_json::from_str::<Config>(&content) {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    match serde_json::from_str::<Config>(&content) {
                         Ok(mut cfg) => {
                             eprintln!("Config loaded: {}", path.display());
                             // heading_styles のキー（完全一致部分）を正規化
@@ -174,8 +174,7 @@ impl Config {
                         Err(e) => {
                             eprintln!("Warning: failed to parse config {}: {}", path.display(), e);
                         }
-                    },
-                    Err(_) => {}
+                    }
                 }
             }
         }

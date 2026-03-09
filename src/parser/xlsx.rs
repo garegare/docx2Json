@@ -102,7 +102,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
     // データ行数超過: ヘッダー行を保持しながら子 Section に分割
     let header = rows[0].clone();
     let data_rows = &rows[1..];
-    let chunk_count = (data_row_count + max_rows - 1) / max_rows;
+    let chunk_count = data_row_count.div_ceil(max_rows);
 
     let children: Vec<Section> = data_rows
         .chunks(max_rows)
