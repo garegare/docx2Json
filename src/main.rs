@@ -1,4 +1,3 @@
-mod ai;
 mod commands;
 mod config;
 mod models;
@@ -27,10 +26,6 @@ struct Cli {
     /// 出力ディレクトリ（省略時は入力ファイルと同じ場所に出力）
     #[arg(short, long)]
     output: Option<PathBuf>,
-
-    /// AI変換を有効化（ANTHROPIC_API_KEY 環境変数が必要）
-    #[arg(long, hide = true)]
-    ai: bool,
 
     /// 設定ファイルのパス（省略時は入力ディレクトリ内の docx2json.json を自動検索）
     #[arg(long)]
@@ -113,10 +108,10 @@ fn main() {
                 image_quality: cli.image_quality,
                 xlsx_max_rows: cli.xlsx_max_rows,
             };
-            run_parse(args, cli.ai);
+            run_parse(args);
         }
         Some(Commands::Parse(args)) => {
-            run_parse(args, false);
+            run_parse(args);
         }
         Some(Commands::ExtractCandidates(args)) => {
             if let Err(e) = commands::extract_candidates::run(args) {
@@ -140,7 +135,7 @@ fn main() {
 }
 
 /// `parse` サブコマンド（またはサブコマンドなし時の後方互換）の実処理
-fn run_parse(args: ParseArgs, use_ai: bool) {
+fn run_parse(args: ParseArgs) {
     // 設定ファイルを読み込む
     let input_dir = if args.input.is_file() {
         args.input.parent().unwrap_or(&args.input).to_path_buf()
@@ -190,7 +185,6 @@ fn run_parse(args: ParseArgs, use_ai: bool) {
             pb.set_message(filename);
 
             let result = parser::parse_file(path, &cfg)
-                .map(|doc| if use_ai { ai::transform(doc) } else { doc })
                 .and_then(|doc| {
                     if let Some(level) = args.split {
                         splitter::write_chunks(&doc, path, args.output.as_deref(), level)
