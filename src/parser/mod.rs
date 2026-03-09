@@ -1,5 +1,6 @@
 pub mod docx;
 pub mod xlsx;
+pub mod xlsx_advanced;
 
 use std::path::Path;
 
@@ -12,8 +13,16 @@ pub fn parse_file(path: &Path, config: &Config) -> Result<Document> {
     let mut doc = match path.extension().and_then(|e| e.to_str()) {
         Some("docx") => docx::parse(path, config)
             .with_context(|| format!("DOCXパース失敗: {}", path.display()))?,
-        Some("xlsx") => xlsx::parse(path, config)
-            .with_context(|| format!("XLSXパース失敗: {}", path.display()))?,
+        Some("xlsx") => {
+            // xlsx_heading.enabled == true のとき神エクセル対応パーサーに切り替え
+            if config.xlsx_heading.as_ref().map_or(false, |h| h.enabled) {
+                xlsx_advanced::parse(path, config)
+                    .with_context(|| format!("XLSX(advanced)パース失敗: {}", path.display()))?
+            } else {
+                xlsx::parse(path, config)
+                    .with_context(|| format!("XLSXパース失敗: {}", path.display()))?
+            }
+        }
         ext => anyhow::bail!("未対応のファイル形式: {:?}", ext),
     };
 
