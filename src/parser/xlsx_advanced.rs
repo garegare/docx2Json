@@ -4,9 +4,9 @@
 /// 既存の `xlsx.rs` は一切変更しない。
 ///
 /// ## 実装する3機能
-/// - **A: セル結合解決** — `<mergeCell>` を展開し結合元の値を全セルにコピー
-/// - **B: 書式ベースの見出し判定** — `xl/styles.xml` を解析し太字・背景色行を見出しに昇格
-/// - **C: 浮遊テキストボックス抽出** — `xl/drawings/drawing*.xml` の `<xdr:sp>` テキストを抽出
+/// - **A: セル結合解決** — `<mergeCell>` を展開し結合元の値を全セルにコピー（Phase 1）
+/// - **B: 書式ベースの見出し判定** — `xl/styles.xml` の太字・背景色行を見出しに昇格（Phase 2）
+/// - **C: 浮遊テキストボックス抽出** — `xl/drawings/drawing*.xml` のテキスト抽出（Phase 3）
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -62,14 +62,17 @@ struct XlsxStyles {
     cell_styles: Vec<CellStyleInfo>,
 }
 
+/// 行の分類結果
+enum RowKind {
+    Heading, // 書式ベース見出し行
+    Data,    // データ行
+}
+
 // ============================================================
 // エントリポイント
 // ============================================================
 
 /// 神エクセル対応 XLSX パーサーのエントリポイント
-///
-/// Phase 1 では xlsx.rs の `parse` と同じ結果を返すスケルトン実装。
-/// Phase 2 以降でセル結合解決・書式ベース見出し判定・浮遊テキストボックスを追加する。
 pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     let title = path
         .file_stem()
@@ -90,7 +93,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     // 3. 共有文字列テーブル
     let shared_strings = parse_shared_strings(&mut archive).unwrap_or_default();
 
-    // 4. スタイルテーブル（Phase 2 で本実装）
+    // 4. スタイルテーブル（xl/styles.xml → cellXfs → fonts/fills を解決）
     let styles = parse_styles(&mut archive).unwrap_or_default();
 
     // 5. 各シートを Section に変換
@@ -116,13 +119,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
                     parse_sheet_drawings(&mut archive, &sheet_path, sheet_idx)
                         .unwrap_or_default();
 
-                let section = build_section(
-                    name,
-                    data,
-                    &styles,
-                    drawing_texts,
-                    config,
-                );
+                let section = build_section(name, data, &styles, drawing_texts, config);
                 sections.push(section);
             }
             Err(e) => {
@@ -149,17 +146,14 @@ fn build_section(
     // A: セル結合展開（常に実行）
     apply_merge_cells(&mut data);
 
-    // 密グリッドに変換
-    let grid = to_dense_grid(&data);
-
     // B: Section 生成（書式ベース or 従来フラット）
-    let mut section =
-        if config.xlsx_heading.as_ref().map_or(false, |h| h.enabled) {
-            let hcfg = config.xlsx_heading.as_ref().unwrap();
-            build_section_with_headings(name, &grid, styles, hcfg, config.xlsx_max_rows)
-        } else {
-            build_section_flat(name, grid, config.xlsx_max_rows)
-        };
+    let mut section = if config.xlsx_heading.as_ref().map_or(false, |h| h.enabled) {
+        let hcfg = config.xlsx_heading.as_ref().unwrap();
+        build_section_with_headings(name, &data, styles, hcfg, config.xlsx_max_rows)
+    } else {
+        let grid = to_dense_grid(&data);
+        build_section_flat(name, grid, config.xlsx_max_rows)
+    };
 
     // C: 浮遊テキストボックスを body_text に追記（常に実行）
     if !drawing_texts.is_empty() {
@@ -237,18 +231,191 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
     }
 }
 
-/// 書式ベース見出し判定モード（Phase 2 で本実装）
+/// 書式ベース見出し判定モード（Phase 2 本実装）
 ///
-/// Phase 1 では従来フラットモードにフォールバックする。
+/// 太字・背景色などの書式を持つ行を見出しと判定し、
+/// 見出しが現れるたびに新しい子 Section を作成する。
+///
+/// 見出し行が一度も出現しない場合は従来フラットモードにフォールバックする。
 fn build_section_with_headings(
     name: &str,
-    grid: &[Vec<String>],
-    _styles: &XlsxStyles,
-    _hcfg: &XlsxHeadingConfig,
+    data: &WorksheetData,
+    styles: &XlsxStyles,
+    hcfg: &XlsxHeadingConfig,
     max_rows: usize,
 ) -> Section {
-    // TODO Phase 2: styles を使った見出し判定を実装
-    build_section_flat(name, grid.to_vec(), max_rows)
+    // ヘッダー前のデータ行（最初の見出し行より前にある行）
+    let mut pre_heading_rows: Vec<Vec<String>> = Vec::new();
+    // (見出しテキスト, データ行リスト) のグループリスト
+    let mut groups: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_data: Vec<Vec<String>> = Vec::new();
+    let mut has_any_heading = false;
+
+    for r in 0..data.max_row {
+        // 行の値を収集
+        let row_values: Vec<String> = (0..data.max_col)
+            .map(|c| {
+                data.cells
+                    .get(&(r, c))
+                    .map_or(String::new(), |cell| cell.value.clone())
+            })
+            .collect();
+
+        // 完全空行はスキップ
+        if row_values.iter().all(|v| v.is_empty()) {
+            continue;
+        }
+
+        match classify_row(r, data, styles, hcfg) {
+            RowKind::Heading => {
+                // 直前のグループを確定
+                if let Some(h) = current_heading.take() {
+                    groups.push((h, std::mem::take(&mut current_data)));
+                } else if !pre_heading_rows.is_empty() {
+                    // 見出し前のデータ行は空見出しグループとして扱う
+                    groups.push((String::new(), std::mem::take(&mut pre_heading_rows)));
+                }
+                // 見出しテキスト: 空でないセルをスペースで結合
+                let heading_text = row_values
+                    .iter()
+                    .filter(|v| !v.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                current_heading = Some(heading_text);
+                has_any_heading = true;
+            }
+            RowKind::Data => {
+                if current_heading.is_none() {
+                    pre_heading_rows.push(row_values);
+                } else {
+                    current_data.push(row_values);
+                }
+            }
+        }
+    }
+
+    // 最終グループを確定
+    if let Some(h) = current_heading {
+        groups.push((h, current_data));
+    }
+
+    // 見出しが一切なければ従来フラットモードにフォールバック
+    if !has_any_heading {
+        let grid = to_dense_grid(data);
+        return build_section_flat(name, grid, max_rows);
+    }
+
+    // 親 Section の body_text = 見出し前のデータ（通常は空）
+    let parent_body = if pre_heading_rows.is_empty() {
+        String::new()
+    } else {
+        grid_to_markdown(&pre_heading_rows)
+    };
+
+    // 各グループを子 Section に変換
+    let children: Vec<Section> = groups
+        .into_iter()
+        .filter(|(h, rows)| !h.is_empty() || !rows.is_empty())
+        .map(|(heading, data_rows)| {
+            // max_rows による子 Section のチャンク分割
+            if max_rows == 0 || data_rows.len() <= max_rows {
+                Section {
+                    context_path: Vec::new(),
+                    heading,
+                    body_text: grid_to_markdown(&data_rows),
+                    assets: Vec::new(),
+                    children: Vec::new(),
+                }
+            } else {
+                // 行数超過: チャンク分割して孫 Section を生成
+                let chunk_count = (data_rows.len() + max_rows - 1) / max_rows;
+                let chunk_children: Vec<Section> = data_rows
+                    .chunks(max_rows)
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let start = i * max_rows + 1;
+                        let end = start + chunk.len() - 1;
+                        Section {
+                            context_path: Vec::new(),
+                            heading: format!("{} [行 {}–{}]", heading, start, end),
+                            body_text: grid_to_markdown(chunk),
+                            assets: Vec::new(),
+                            children: Vec::new(),
+                        }
+                    })
+                    .collect();
+                Section {
+                    context_path: Vec::new(),
+                    heading,
+                    body_text: format!(
+                        "（全 {} 行 / {} 行ずつ {} チャンクに分割）",
+                        data_rows.len(),
+                        max_rows,
+                        chunk_count
+                    ),
+                    assets: Vec::new(),
+                    children: chunk_children,
+                }
+            }
+        })
+        .collect();
+
+    Section {
+        context_path: Vec::new(),
+        heading: name.to_string(),
+        body_text: parent_body,
+        assets: Vec::new(),
+        children,
+    }
+}
+
+/// 行を Heading / Data に分類する
+///
+/// 行内の空でないセルのうち、「見出し書式」を持つセルの割合が
+/// `hcfg.heading_cell_ratio` 以上なら `Heading`、未満なら `Data`。
+///
+/// 見出し書式の条件（いずれかが true）:
+/// - `detect_bold && style.bold`
+/// - `detect_fill && style.has_fill`
+/// - `heading_font_size_threshold > 0 && style.font_size >= threshold`
+fn classify_row(
+    row_idx: usize,
+    data: &WorksheetData,
+    styles: &XlsxStyles,
+    hcfg: &XlsxHeadingConfig,
+) -> RowKind {
+    let non_empty_cells: Vec<&CellInfo> = (0..data.max_col)
+        .filter_map(|c| data.cells.get(&(row_idx, c)))
+        .filter(|cell| !cell.value.is_empty())
+        .collect();
+
+    if non_empty_cells.is_empty() {
+        return RowKind::Data;
+    }
+
+    let heading_count = non_empty_cells
+        .iter()
+        .filter(|cell| {
+            let style = cell
+                .style_idx
+                .and_then(|i| styles.cell_styles.get(i))
+                .cloned()
+                .unwrap_or_default();
+            (hcfg.detect_bold && style.bold)
+                || (hcfg.detect_fill && style.has_fill)
+                || (hcfg.heading_font_size_threshold > 0.0
+                    && style.font_size >= hcfg.heading_font_size_threshold)
+        })
+        .count();
+
+    let ratio = heading_count as f32 / non_empty_cells.len() as f32;
+    if ratio >= hcfg.heading_cell_ratio {
+        RowKind::Heading
+    } else {
+        RowKind::Data
+    }
 }
 
 // ============================================================
@@ -258,25 +425,21 @@ fn build_section_with_headings(
 /// セル結合を展開する: 結合元セルの値・スタイルを結合範囲全体にコピーする
 fn apply_merge_cells(data: &mut WorksheetData) {
     for m in &data.merges {
-        // 結合元（左上）の値とスタイルを取得
         let (origin_val, origin_style) = data
             .cells
             .get(&(m.min_row, m.min_col))
             .map(|c| (c.value.clone(), c.style_idx))
             .unwrap_or_default();
 
-        // 結合範囲の全セルに書き込み（元セル自身は除外）
         for r in m.min_row..=m.max_row {
             for c in m.min_col..=m.max_col {
                 if r == m.min_row && c == m.min_col {
                     continue;
                 }
-                data.cells
-                    .entry((r, c))
-                    .or_insert_with(|| CellInfo {
-                        value: origin_val.clone(),
-                        style_idx: origin_style,
-                    });
+                data.cells.entry((r, c)).or_insert_with(|| CellInfo {
+                    value: origin_val.clone(),
+                    style_idx: origin_style,
+                });
             }
         }
     }
@@ -451,7 +614,6 @@ fn parse_worksheet(
                     b"v" => in_v = true,
                     b"t" => in_t = true,
                     b"mergeCell" => {
-                        // <mergeCell ref="A1:C3"/> を解析
                         for attr in e.attributes().flatten() {
                             if attr.key.local_name().as_ref() == b"ref" {
                                 let ref_str = decode_bytes(&attr.value);
@@ -497,17 +659,206 @@ fn parse_worksheet(
     })
 }
 
-/// `xl/styles.xml` を解析してスタイルテーブルを返す（Phase 2 で本実装）
+/// `xl/styles.xml` を解析してスタイルテーブルを返す（Phase 2 本実装）
 ///
-/// Phase 1 では空のテーブルを返すスタブ。
-fn parse_styles(_archive: &mut ZipArchive<File>) -> Result<XlsxStyles> {
-    // TODO Phase 2: cellXfs / fonts / fills を解析して CellStyleInfo を構築する
-    Ok(XlsxStyles::default())
+/// 参照チェーン: `cellXfs[i].fontId` → `fonts[fontId]` (bold, font_size)
+///              `cellXfs[i].fillId` → `fills[fillId]` (has_fill)
+fn parse_styles(archive: &mut ZipArchive<File>) -> Result<XlsxStyles> {
+    let content = match read_zip_entry(archive, "xl/styles.xml") {
+        Ok(c) => c,
+        Err(_) => return Ok(XlsxStyles::default()),
+    };
+
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    // 中間データ
+    struct FontRec {
+        bold: bool,
+        font_size: f32,
+    }
+    struct FillRec {
+        has_fill: bool,
+    }
+
+    let mut fonts: Vec<FontRec> = Vec::new();
+    let mut fills: Vec<FillRec> = Vec::new();
+    let mut xf_records: Vec<(usize, usize)> = Vec::new(); // (font_id, fill_id)
+
+    // 状態フラグ
+    let mut in_fonts = false;
+    let mut in_fills = false;
+    let mut in_cell_xfs = false;
+    let mut in_font = false;
+    let mut in_fill = false;
+    let mut in_xf = false; // <xf> が Start で開始された（End で push）
+
+    // 現在処理中のフォント情報
+    let mut cur_bold = false;
+    let mut cur_font_size = 0.0f32;
+
+    // 現在処理中のフィル情報
+    let mut cur_pattern_type = String::new();
+    let mut cur_has_fgcolor = false;
+
+    // 現在処理中の cellXf 情報（Start 型 <xf> 用）
+    let mut cur_xf_font_id = 0usize;
+    let mut cur_xf_fill_id = 0usize;
+
+    loop {
+        match reader.read_event()? {
+            // ---- Start イベント ----
+            Event::Start(e) => match e.local_name().as_ref() {
+                b"fonts" => in_fonts = true,
+                b"fills" => in_fills = true,
+                b"cellXfs" => in_cell_xfs = true,
+                b"font" if in_fonts => {
+                    in_font = true;
+                    cur_bold = false;
+                    cur_font_size = 0.0;
+                }
+                b"fill" if in_fills => {
+                    in_fill = true;
+                    cur_pattern_type.clear();
+                    cur_has_fgcolor = false;
+                }
+                b"patternFill" if in_fill => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"patternType" {
+                            cur_pattern_type = decode_bytes(&attr.value);
+                        }
+                    }
+                }
+                b"fgColor" if in_fill => {
+                    // fgColor に rgb / theme / indexed のいずれかがあれば色あり
+                    for attr in e.attributes().flatten() {
+                        match attr.key.local_name().as_ref() {
+                            b"rgb" | b"theme" | b"indexed" => cur_has_fgcolor = true,
+                            _ => {}
+                        }
+                    }
+                }
+                b"xf" if in_cell_xfs => {
+                    cur_xf_font_id = 0;
+                    cur_xf_fill_id = 0;
+                    in_xf = true;
+                    for attr in e.attributes().flatten() {
+                        match attr.key.local_name().as_ref() {
+                            b"fontId" => {
+                                cur_xf_font_id = decode_bytes(&attr.value).parse().unwrap_or(0)
+                            }
+                            b"fillId" => {
+                                cur_xf_fill_id = decode_bytes(&attr.value).parse().unwrap_or(0)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // <b> タグが Start で書かれる場合（<b></b> 形式）
+                b"b" if in_font => cur_bold = true,
+                _ => {}
+            },
+
+            // ---- Empty イベント（自己終了タグ）----
+            Event::Empty(e) => match e.local_name().as_ref() {
+                b"patternFill" if in_fill => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"patternType" {
+                            cur_pattern_type = decode_bytes(&attr.value);
+                        }
+                    }
+                }
+                b"fgColor" if in_fill => {
+                    for attr in e.attributes().flatten() {
+                        match attr.key.local_name().as_ref() {
+                            b"rgb" | b"theme" | b"indexed" => cur_has_fgcolor = true,
+                            _ => {}
+                        }
+                    }
+                }
+                // <b/> : 太字（最も一般的な形式）
+                b"b" if in_font => {
+                    // <b val="0"/> は非太字
+                    let mut is_bold = true;
+                    for attr in e.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"val"
+                            && decode_bytes(&attr.value) == "0"
+                        {
+                            is_bold = false;
+                        }
+                    }
+                    cur_bold = is_bold;
+                }
+                // <sz val="N"/> : フォントサイズ
+                b"sz" if in_font => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"val" {
+                            cur_font_size = decode_bytes(&attr.value).parse().unwrap_or(0.0);
+                        }
+                    }
+                }
+                // <xf .../> : cellXfs 内の自己終了型 cell format
+                b"xf" if in_cell_xfs => {
+                    let mut font_id = 0usize;
+                    let mut fill_id = 0usize;
+                    for attr in e.attributes().flatten() {
+                        match attr.key.local_name().as_ref() {
+                            b"fontId" => font_id = decode_bytes(&attr.value).parse().unwrap_or(0),
+                            b"fillId" => fill_id = decode_bytes(&attr.value).parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                    xf_records.push((font_id, fill_id));
+                }
+                _ => {}
+            },
+
+            // ---- End イベント ----
+            Event::End(e) => match e.local_name().as_ref() {
+                b"fonts" => in_fonts = false,
+                b"fills" => in_fills = false,
+                b"cellXfs" => in_cell_xfs = false,
+                b"font" if in_fonts => {
+                    fonts.push(FontRec {
+                        bold: cur_bold,
+                        font_size: cur_font_size,
+                    });
+                    in_font = false;
+                }
+                b"fill" if in_fills => {
+                    // patternType == "solid" かつ fgColor 属性あり → 有色背景
+                    let has_fill = cur_pattern_type == "solid" && cur_has_fgcolor;
+                    fills.push(FillRec { has_fill });
+                    in_fill = false;
+                }
+                b"xf" if in_xf && in_cell_xfs => {
+                    xf_records.push((cur_xf_font_id, cur_xf_fill_id));
+                    in_xf = false;
+                }
+                _ => {}
+            },
+
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    // cellXfs の各エントリを解決済み CellStyleInfo に変換
+    let cell_styles = xf_records
+        .iter()
+        .map(|&(font_id, fill_id)| CellStyleInfo {
+            bold: fonts.get(font_id).map_or(false, |f| f.bold),
+            font_size: fonts.get(font_id).map_or(0.0, |f| f.font_size),
+            has_fill: fills.get(fill_id).map_or(false, |f| f.has_fill),
+        })
+        .collect();
+
+    Ok(XlsxStyles { cell_styles })
 }
 
 /// シートに関連付けられた Drawing ファイルからテキストを抽出する（Phase 3 で本実装）
 ///
-/// Phase 1 では空ベクターを返すスタブ。
+/// Phase 2 では空ベクターを返すスタブ。
 fn parse_sheet_drawings(
     _archive: &mut ZipArchive<File>,
     _sheet_path: &str,
@@ -568,7 +919,10 @@ fn col_index(cell_ref: &str) -> usize {
 /// セルアドレス（"A1"）を (row, col) の 0-indexed タプルに変換する
 fn parse_cell_address(addr: &str) -> Option<(usize, usize)> {
     let col_str: String = addr.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-    let row_str: String = addr.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let row_str: String = addr
+        .chars()
+        .skip_while(|c| c.is_ascii_alphabetic())
+        .collect();
     if col_str.is_empty() || row_str.is_empty() {
         return None;
     }
