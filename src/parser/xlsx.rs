@@ -81,6 +81,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             body_text: String::new(),
             assets: Vec::new(),
             children: Vec::new(),
+            ..Default::default()
         };
     }
 
@@ -94,6 +95,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             body_text: grid_to_markdown(&rows),
             assets: Vec::new(),
             children: Vec::new(),
+            ..Default::default()
         };
     }
 
@@ -120,6 +122,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
                 body_text: grid_to_markdown(&child_rows),
                 assets: Vec::new(),
                 children: Vec::new(),
+                ..Default::default()
             }
         })
         .collect();
@@ -133,6 +136,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
         ),
         assets: Vec::new(),
         children,
+        ..Default::default()
     }
 }
 

@@ -582,6 +582,7 @@ fn parse_document_xml(
                             body_text: String::new(),
                             assets,
                             children: Vec::new(),
+                            ..Default::default()
                         };
                         // スタックを巻き戻してこのレベルの親を探す（#1 スタック操作）
                         //

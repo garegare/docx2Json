@@ -186,6 +186,7 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
             body_text: String::new(),
             assets: Vec::new(),
             children: Vec::new(),
+            ..Default::default()
         };
     }
 
@@ -198,6 +199,7 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
             body_text: grid_to_markdown(&grid),
             assets: Vec::new(),
             children: Vec::new(),
+            ..Default::default()
         };
     }
 
@@ -221,6 +223,7 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
                 body_text: grid_to_markdown(&child_rows),
                 assets: Vec::new(),
                 children: Vec::new(),
+                ..Default::default()
             }
         })
         .collect();
@@ -234,6 +237,7 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
         ),
         assets: Vec::new(),
         children,
+        ..Default::default()
     }
 }
 
@@ -333,6 +337,7 @@ fn build_section_with_headings(
                     body_text: grid_to_markdown(&data_rows),
                     assets: Vec::new(),
                     children: Vec::new(),
+                    ..Default::default()
                 }
             } else {
                 // 行数超過: チャンク分割して孫 Section を生成
@@ -349,6 +354,7 @@ fn build_section_with_headings(
                             body_text: grid_to_markdown(chunk),
                             assets: Vec::new(),
                             children: Vec::new(),
+                            ..Default::default()
                         }
                     })
                     .collect();
@@ -363,6 +369,7 @@ fn build_section_with_headings(
                     ),
                     assets: Vec::new(),
                     children: chunk_children,
+                    ..Default::default()
                 }
             }
         })
@@ -374,6 +381,7 @@ fn build_section_with_headings(
         body_text: parent_body,
         assets: Vec::new(),
         children,
+        ..Default::default()
     }
 }
 

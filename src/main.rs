@@ -1,4 +1,4 @@
-mod ai;
+mod commands;
 mod config;
 mod models;
 mod output;
@@ -7,24 +7,25 @@ mod splitter;
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(name = "docx2json", about = "DOCX/XLSX を AI向け構造化JSON に変換する")]
 struct Cli {
-    /// 入力ディレクトリ（.docx / .xlsx を再帰的にスキャン）
+    /// サブコマンド（省略時は parse として動作）
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    // ---- 後方互換: サブコマンドなしのとき parse として動作するオプション群 ----
+    /// 入力ディレクトリまたはファイル（.docx / .xlsx を再帰的にスキャン）
     #[arg(short, long, default_value = ".")]
     input: PathBuf,
 
     /// 出力ディレクトリ（省略時は入力ファイルと同じ場所に出力）
     #[arg(short, long)]
     output: Option<PathBuf>,
-
-    /// AI変換を有効化（ANTHROPIC_API_KEY 環境変数が必要）
-    #[arg(long)]
-    ai: bool,
 
     /// 設定ファイルのパス（省略時は入力ディレクトリ内の docx2json.json を自動検索）
     #[arg(long)]
@@ -36,18 +37,58 @@ struct Cli {
     split: Option<usize>,
 
     /// 画像の最大辺長（ピクセル）。超過する画像をこのサイズにリサイズし JPEG 再エンコードする。
-    /// 省略時はリサイズなし。設定ファイルの image_max_px より優先される。
     #[arg(long, value_name = "PIXELS")]
     image_max_px: Option<u32>,
 
-    /// JPEG 再エンコード品質（1〜100）。--image-max-px と組み合わせて使用する。
-    /// 省略時は設定ファイルの image_quality（デフォルト 80）を使用。
+    /// JPEG 再エンコード品質（1〜100）
     #[arg(long, value_name = "QUALITY")]
     image_quality: Option<u8>,
 
-    /// XLSX 1シートあたりの最大データ行数。超過した場合ヘッダーを引き継いだ
-    /// 子 Section に分割する（RAG チャンク化）。省略時は設定ファイルの
-    /// xlsx_max_rows（デフォルト 0 = 制限なし）を使用。
+    /// XLSX 1シートあたりの最大データ行数（超過時に子 Section に分割）
+    #[arg(long, value_name = "ROWS")]
+    xlsx_max_rows: Option<usize>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// DOCX/XLSX ファイルをパースして document.json を生成する（デフォルト動作と同一）
+    Parse(ParseArgs),
+    /// document.json から LLM 向け候補テキストを JSONL 形式で抽出する
+    ExtractCandidates(commands::extract_candidates::Args),
+    /// セクションに AI タグを注入してバリデーションする
+    InjectTags(commands::inject_tags::Args),
+    /// 複数の document.json からタグ使用統計を集計する
+    Summarize(commands::summarize::Args),
+}
+
+/// `parse` サブコマンドの引数（後方互換オプションと同一）
+#[derive(Args)]
+struct ParseArgs {
+    /// 入力ディレクトリまたはファイル（.docx / .xlsx を再帰的にスキャン）
+    #[arg(short, long, default_value = ".")]
+    input: PathBuf,
+
+    /// 出力ディレクトリ（省略時は入力ファイルと同じ場所に出力）
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+
+    /// 設定ファイルのパス（省略時は入力ディレクトリ内の docx2json.json を自動検索）
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// セクション単位のチャンク分割レベル（RAG 向け）
+    #[arg(long, value_name = "LEVEL")]
+    split: Option<usize>,
+
+    /// 画像の最大辺長（ピクセル）
+    #[arg(long, value_name = "PIXELS")]
+    image_max_px: Option<u32>,
+
+    /// JPEG 再エンコード品質（1〜100）
+    #[arg(long, value_name = "QUALITY")]
+    image_quality: Option<u8>,
+
+    /// XLSX 1シートあたりの最大データ行数
     #[arg(long, value_name = "ROWS")]
     xlsx_max_rows: Option<usize>,
 }
@@ -55,20 +96,60 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    match cli.command {
+        None => {
+            // 後方互換: サブコマンドなし → parse として動作
+            let args = ParseArgs {
+                input: cli.input,
+                output: cli.output,
+                config: cli.config,
+                split: cli.split,
+                image_max_px: cli.image_max_px,
+                image_quality: cli.image_quality,
+                xlsx_max_rows: cli.xlsx_max_rows,
+            };
+            run_parse(args);
+        }
+        Some(Commands::Parse(args)) => {
+            run_parse(args);
+        }
+        Some(Commands::ExtractCandidates(args)) => {
+            if let Err(e) = commands::extract_candidates::run(args) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::InjectTags(args)) => {
+            if let Err(e) = commands::inject_tags::run(args) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Summarize(args)) => {
+            if let Err(e) = commands::summarize::run(args) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// `parse` サブコマンド（またはサブコマンドなし時の後方互換）の実処理
+fn run_parse(args: ParseArgs) {
     // 設定ファイルを読み込む
-    let input_dir = if cli.input.is_file() {
-        cli.input.parent().unwrap_or(&cli.input).to_path_buf()
+    let input_dir = if args.input.is_file() {
+        args.input.parent().unwrap_or(&args.input).to_path_buf()
     } else {
-        cli.input.clone()
+        args.input.clone()
     };
-    let mut cfg = config::Config::load(cli.config.as_deref(), &input_dir);
+    let mut cfg = config::Config::load(args.config.as_deref(), &input_dir);
     // CLI 引数で設定を上書き（設定ファイルより優先）
-    if let Some(px) = cli.image_max_px    { cfg.image_max_px = px; }
-    if let Some(q)  = cli.image_quality   { cfg.image_quality = q.clamp(1, 100); }
-    if let Some(r)  = cli.xlsx_max_rows   { cfg.xlsx_max_rows = r; }
+    if let Some(px) = args.image_max_px    { cfg.image_max_px = px; }
+    if let Some(q)  = args.image_quality   { cfg.image_quality = q.clamp(1, 100); }
+    if let Some(r)  = args.xlsx_max_rows   { cfg.xlsx_max_rows = r; }
 
     // 出力ディレクトリを作成
-    if let Some(ref out) = cli.output {
+    if let Some(ref out) = args.output {
         if let Err(e) = std::fs::create_dir_all(out) {
             eprintln!("Error creating output directory: {}", e);
             std::process::exit(1);
@@ -76,15 +157,13 @@ fn main() {
     }
 
     // 対象ファイルを収集
-    let files = collect_files(&cli.input);
+    let files = collect_files(&args.input);
     if files.is_empty() {
-        eprintln!("No .docx or .xlsx files found in: {}", cli.input.display());
+        eprintln!("No .docx or .xlsx files found in: {}", args.input.display());
         std::process::exit(1);
     }
 
-    // ---- プログレスバーを初期化（#13）----
-    // indicatif により「処理済み / 合計」と現在処理中ファイル名をリアルタイム表示する。
-    // rayon の並列処理とは pb.inc()/set_message() がスレッドセーフに動作するため共用可能。
+    // ---- プログレスバーを初期化 ----
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -99,7 +178,6 @@ fn main() {
     let results: Vec<_> = files
         .par_iter()
         .map(|path| {
-            // 現在処理中のファイル名をプログレスバーに表示
             let filename = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -107,12 +185,11 @@ fn main() {
             pb.set_message(filename);
 
             let result = parser::parse_file(path, &cfg)
-                .map(|doc| if cli.ai { ai::transform(doc) } else { doc })
                 .and_then(|doc| {
-                    if let Some(level) = cli.split {
-                        splitter::write_chunks(&doc, path, cli.output.as_deref(), level)
+                    if let Some(level) = args.split {
+                        splitter::write_chunks(&doc, path, args.output.as_deref(), level)
                     } else {
-                        output::write_json(&doc, path, cli.output.as_deref())
+                        output::write_json(&doc, path, args.output.as_deref())
                     }
                 });
 
@@ -123,13 +200,12 @@ fn main() {
 
     pb.finish_and_clear();
 
-    // ---- 結果サマリーを表示（#13 + 既存機能）----
+    // ---- 結果サマリーを表示 ----
     let (ok, err): (Vec<_>, Vec<_>) = results.iter().partition(|(_, r)| r.is_ok());
 
-    // 成功ファイルの出力先を一覧表示
     for (path, _) in ok.iter() {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
-        let out_path = if let Some(ref dir) = cli.output {
+        let out_path = if let Some(ref dir) = args.output {
             dir.join(format!("{}.json", stem)).display().to_string()
         } else {
             path.with_extension("json").display().to_string()
@@ -144,7 +220,6 @@ fn main() {
         format_elapsed(pb.elapsed()),
     );
 
-    // 失敗ファイルのエラー詳細
     for (path, e) in err.iter() {
         if let Err(e) = e {
             eprintln!("\n  ✗ FAILED: {}", path.display());
@@ -154,7 +229,6 @@ fn main() {
         }
     }
 
-    // 1件でも失敗があれば非ゼロ終了コード
     if !err.is_empty() {
         std::process::exit(1);
     }

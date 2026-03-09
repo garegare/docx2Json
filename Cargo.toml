@@ -19,7 +19,3 @@ clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 regex = "1"
 indicatif = "0.17"
-ureq = { version = "2", optional = true }
-
-[features]
-ai = ["ureq"]
