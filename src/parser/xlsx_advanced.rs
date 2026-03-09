@@ -94,7 +94,13 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     let shared_strings = parse_shared_strings(&mut archive).unwrap_or_default();
 
     // 4. スタイルテーブル（xl/styles.xml → cellXfs → fonts/fills を解決）
-    let styles = parse_styles(&mut archive).unwrap_or_default();
+    let styles = match parse_styles(&mut archive) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Warning: xl/styles.xml の解析に失敗しました（書式ベース見出し判定が無効化されます）: {e}");
+            XlsxStyles::default()
+        }
+    };
 
     // 5. 各シートを Section に変換
     let mut sections = Vec::new();
