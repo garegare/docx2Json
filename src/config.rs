@@ -3,6 +3,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+/// XLSX 書式ベース見出し判定の設定（#10 神エクセル対応）
+///
+/// `docx2json.json` の `xlsx_heading` キーで設定する。
+/// `enabled: false`（省略時のデフォルト）の場合は従来モード（先頭行ヘッダー）を維持し、
+/// 既存の xlsx パーサーへの影響はゼロ。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct XlsxHeadingConfig {
+    /// 書式ベース見出し判定を有効にするか（デフォルト: false）
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 太字セルを見出し条件にするか（デフォルト: true）
+    #[serde(default = "default_true")]
+    pub detect_bold: bool,
+
+    /// 非白・非透明の背景色セルを見出し条件にするか（デフォルト: true）
+    #[serde(default = "default_true")]
+    pub detect_fill: bool,
+
+    /// 見出し判定の最小フォントサイズ（pt）。0.0 = 無効（デフォルト: 0.0）
+    #[serde(default)]
+    pub heading_font_size_threshold: f32,
+
+    /// 行内で「見出し書式」セルが占める割合の閾値（0.0〜1.0）。
+    /// この割合以上なら行全体を見出し行と判定する。デフォルト: 0.5
+    #[serde(default = "default_heading_cell_ratio")]
+    pub heading_cell_ratio: f32,
+}
+
+fn default_heading_cell_ratio() -> f32 {
+    0.5
+}
+
 /// 変換設定（docx2json.json から読み込む）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -41,6 +74,12 @@ pub struct Config {
     /// 0 = 制限なし（デフォルト）。`--xlsx-max-rows` CLI 引数が優先。
     #[serde(default)]
     pub xlsx_max_rows: usize,
+
+    /// XLSX 書式ベース見出し判定設定（#10 神エクセル対応）。
+    /// `null` または省略時は従来モード（先頭行ヘッダー、xlsx.rs を使用）。
+    /// `enabled: true` のときのみ xlsx_advanced パーサーに切り替わる。
+    #[serde(default)]
+    pub xlsx_heading: Option<XlsxHeadingConfig>,
 
     /// ロード時にコンパイル済みのマッチングルール群（serde には含まない）
     #[serde(skip)]
@@ -89,6 +128,7 @@ impl Default for Config {
             image_max_px: 0,
             image_quality: 80,
             xlsx_max_rows: 0,
+            xlsx_heading: None,
             heading_rules: Vec::new(),
         };
         cfg.heading_rules = compile_heading_rules(&cfg.heading_styles);
