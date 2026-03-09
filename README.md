@@ -1,6 +1,6 @@
-# Docx/Xlsx to AI-Ready JSON Converter (Rust)
+# Docx/Xlsx/Pptx to AI-Ready JSON Converter (Rust)
 
-このツールは、Microsoft Office形式（.docx, .xlsx）のドキュメントを解析し、LLM（大規模言語モデル）へのインプットに最適化された構造化JSONへ変換する、Rust製の高パフォーマンス・コンバーターです。
+このツールは、Microsoft Office形式（.docx, .xlsx, .pptx）のドキュメントを解析し、LLM（大規模言語モデル）へのインプットに最適化された構造化JSONへ変換する、Rust製の高パフォーマンス・コンバーターです。
 
 ## 🎯 プロジェクトの目的
 AIによる文書解析（RAGや要約）の精度を最大化するため、単なるテキスト抽出ではなく、文書の**階層構造（見出し・段落の関係）**を維持したまま、ノイズを除去したクリーンなJSONを生成します。
@@ -32,12 +32,7 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **AI タグ候補テキスト抽出** | ✅ | `extract-candidates` サブコマンド。LLM 向けに JSONL 形式でセクションを出力。`--max-body-chars` でトークン節約。 |
 | **AI タグ注入・バリデーション** | ✅ | `inject-tags` サブコマンド。セクション ID 指定でタグを注入し `keywords.json` でバリデーション。 |
 | **タグ使用統計集計** | ✅ | `summarize` サブコマンド。複数ドキュメントのタグ使用頻度を横断集計して `tags_summary.json` を生成。 |
-
-## 🗺 ロードマップ（残タスク）
-
-| # | 機能 | 状態 | 概要 |
-| :- | :--- | :---: | :--- |
-| 9 | **PPTXパース** | 🔲 | スライド単位で `Section` 化。テキストボックスを座標順に結合、スライドノートを補足コンテキストとして抽出 |
+| **PPTXパース** | ✅ | スライド単位で `Section` 化。テキストボックスを Y 座標順に結合し、スライドノートを `[ノート]` として body_text 末尾に付加。画像を `assets` に格納。 |
 
 ## 🛠 技術スタック
 | カテゴリ | ライブラリ | 選定理由 |
@@ -88,8 +83,9 @@ cargo run -- --input ./docs --output ./out
 # 明示的に parse サブコマンドを指定
 cargo run -- parse --input ./docs --output ./out
 
-# 単一ファイル
+# 単一ファイル（.docx / .xlsx / .pptx いずれも対応）
 cargo run -- parse --input ./doc.docx --output ./out
+cargo run -- parse --input ./slides.pptx --output ./out
 
 # 設定ファイルを明示指定
 cargo run -- parse --input ./docs --config ./my-config.json

@@ -12,14 +12,14 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 #[derive(Parser)]
-#[command(name = "docx2json", about = "DOCX/XLSX を AI向け構造化JSON に変換する")]
+#[command(name = "docx2json", about = "DOCX/XLSX/PPTX を AI向け構造化JSON に変換する")]
 struct Cli {
     /// サブコマンド（省略時は parse として動作）
     #[command(subcommand)]
     command: Option<Commands>,
 
     // ---- 後方互換: サブコマンドなしのとき parse として動作するオプション群 ----
-    /// 入力ディレクトリまたはファイル（.docx / .xlsx を再帰的にスキャン）
+    /// 入力ディレクトリまたはファイル（.docx / .xlsx / .pptx を再帰的にスキャン）
     #[arg(short, long, default_value = ".")]
     input: PathBuf,
 
@@ -64,7 +64,7 @@ enum Commands {
 /// `parse` サブコマンドの引数（後方互換オプションと同一）
 #[derive(Args)]
 struct ParseArgs {
-    /// 入力ディレクトリまたはファイル（.docx / .xlsx を再帰的にスキャン）
+    /// 入力ディレクトリまたはファイル（.docx / .xlsx / .pptx を再帰的にスキャン）
     #[arg(short, long, default_value = ".")]
     input: PathBuf,
 
@@ -159,7 +159,7 @@ fn run_parse(args: ParseArgs) {
     // 対象ファイルを収集
     let files = collect_files(&args.input);
     if files.is_empty() {
-        eprintln!("No .docx or .xlsx files found in: {}", args.input.display());
+        eprintln!("No .docx, .xlsx, or .pptx files found in: {}", args.input.display());
         std::process::exit(1);
     }
 
@@ -248,7 +248,7 @@ fn format_elapsed(dur: std::time::Duration) -> String {
 fn collect_files(dir: &std::path::Path) -> Vec<PathBuf> {
     if dir.is_file() {
         let ext = dir.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if matches!(ext, "docx" | "xlsx") {
+        if matches!(ext, "docx" | "xlsx" | "pptx") {
             return vec![dir.to_path_buf()];
         }
         return Vec::new();
@@ -262,7 +262,7 @@ fn collect_files(dir: &std::path::Path) -> Vec<PathBuf> {
                 files.extend(collect_files(&path));
             } else {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if matches!(ext, "docx" | "xlsx") {
+                if matches!(ext, "docx" | "xlsx" | "pptx") {
                     files.push(path);
                 }
             }
