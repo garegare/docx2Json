@@ -123,9 +123,15 @@ fn accumulate_stats(
     }
 }
 
-/// ディレクトリを再帰的にスキャンして .json ファイルを収集する
-/// input がファイルの場合はそのファイル単体を返す
+/// ディレクトリを再帰的にスキャンして .json ファイルを収集する。
+/// input がファイルの場合はそのファイル単体を返す。
+/// シンボリックリンクはスキップして無限ループを防止する。
 fn collect_json_files(input: &PathBuf) -> Vec<PathBuf> {
+    // シンボリックリンクは追跡しない（ディレクトリ・ファイル問わず）
+    if input.is_symlink() {
+        return Vec::new();
+    }
+
     if input.is_file() {
         let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "json" {
@@ -138,6 +144,10 @@ fn collect_json_files(input: &PathBuf) -> Vec<PathBuf> {
     if let Ok(entries) = fs::read_dir(input) {
         for entry in entries.flatten() {
             let path = entry.path();
+            // シンボリックリンクはスキップ（無限ループ・循環参照を防止）
+            if path.is_symlink() {
+                continue;
+            }
             if path.is_dir() {
                 files.extend(collect_json_files(&path));
             } else {

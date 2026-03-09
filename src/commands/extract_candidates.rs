@@ -75,6 +75,9 @@ fn write_sections(
             body_text,
         };
 
+        // serde_json はデフォルトで UTF-8 を直接出力する（日本語等の非 ASCII 文字を
+        // \uXXXX にエスケープしない）。Anthropic API を含む主要 LLM API は
+        // UTF-8 JSONL をそのまま受け付けるため互換性に問題はない。
         let line = serde_json::to_string(&record)
             .with_context(|| format!("JSON シリアライズに失敗: id={}", section.id))?;
         writeln!(writer, "{}", line)?;

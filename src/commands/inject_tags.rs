@@ -84,7 +84,10 @@ pub fn run(args: Args) -> Result<()> {
     let found = inject_tags_recursive(&mut doc.sections, &args.section_id, &valid_tags);
     if !found {
         anyhow::bail!(
-            "セクション ID \"{}\" が document.json に見つかりません",
+            "セクション ID \"{}\" が document.json に見つかりません。\n\
+             ヒント: 元のドキュメントが更新されて parse を再実行した場合、\
+             セクション ID（FNV-1a ハッシュ）が変わっている可能性があります。\
+             extract-candidates で最新の ID を確認してください。",
             args.section_id
         );
     }

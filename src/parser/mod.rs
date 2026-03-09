@@ -51,8 +51,9 @@ fn fill_context_path(sections: &mut Vec<Section>, parent_path: &[String]) {
 
 /// セクションツリーを再帰的に走査し、各セクションに安定 ID を付与する。
 ///
-/// ID は「文書タイトル + context_path を連結した文字列」の FNV-1a 32bit ハッシュの 16進数表現。
+/// ID は「文書タイトル + context_path を連結した文字列」の FNV-1a 64bit ハッシュの 16進数表現。
 /// 追加クレート不要で、同一ドキュメント・同一パスであれば実行間で安定する。
+/// 64bit を採用することで 32bit（数千セクションで衝突期待値 1）より衝突リスクを大幅に低減。
 fn fill_section_id(sections: &mut Vec<Section>, title: &str) {
     for section in sections {
         let key = format!("{}\x00{}", title, section.context_path.join("\x00"));
@@ -61,12 +62,12 @@ fn fill_section_id(sections: &mut Vec<Section>, title: &str) {
     }
 }
 
-/// 文字列の FNV-1a 32bit ハッシュを 8文字の 16進数文字列として返す。
+/// 文字列の FNV-1a 64bit ハッシュを 16文字の 16進数文字列として返す。
 fn fnv1a_hex(s: &str) -> String {
-    const FNV_OFFSET: u32 = 2166136261;
-    const FNV_PRIME: u32 = 16777619;
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
     let hash = s.bytes().fold(FNV_OFFSET, |acc, b| {
-        acc.wrapping_mul(FNV_PRIME) ^ (b as u32)
+        acc.wrapping_mul(FNV_PRIME) ^ (b as u64)
     });
-    format!("{:08x}", hash)
+    format!("{:016x}", hash)
 }
