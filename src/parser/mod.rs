@@ -18,7 +18,7 @@ pub fn parse_file(path: &Path, config: &Config) -> Result<Document> {
             .with_context(|| format!("PPTXパース失敗: {}", path.display()))?,
         Some("xlsx") => {
             // xlsx_heading.enabled == true のとき神エクセル対応パーサーに切り替え
-            if config.xlsx_heading.as_ref().map_or(false, |h| h.enabled) {
+            if config.xlsx_heading.as_ref().is_some_and(|h| h.enabled) {
                 xlsx_advanced::parse(path, config)
                     .with_context(|| format!("XLSX(advanced)パース失敗: {}", path.display()))?
             } else {

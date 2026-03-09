@@ -555,7 +555,7 @@ fn resize_and_compress(data: &[u8], max_px: u32, quality: u8) -> Option<Vec<u8>>
 /// name に ":" が含まれる場合は最後の部分をローカル名として使用する。
 /// ただし "r:embed" など異なる prefix を持つ同名属性が存在しないことが前提。
 fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    let local = name.split(':').last().unwrap_or(name);
+    let local = name.split(':').next_back().unwrap_or(name);
     for attr in e.attributes().flatten() {
         if attr.key.local_name().as_ref() == local.as_bytes() {
             return String::from_utf8(attr.value.to_vec()).ok();

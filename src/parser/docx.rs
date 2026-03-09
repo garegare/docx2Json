@@ -310,7 +310,7 @@ fn parse_document_xml(
                             current_text.push_str(&latex);
                         }
                     }
-                    if in_omath > 0 { in_omath -= 1; }
+                    in_omath = in_omath.saturating_sub(1);
                 } else {
                     omath_pop_and_combine(&mut omath_stack, &local);
                 }
@@ -339,7 +339,7 @@ fn parse_document_xml(
                     }
                     table_rows.clear();
                 }
-                if in_table > 0 { in_table -= 1; }
+                in_table = in_table.saturating_sub(1);
             }
 
             // 行開始（最外テーブルのみ追跡）
@@ -470,14 +470,14 @@ fn parse_document_xml(
                 in_del += 1;
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"del" => {
-                if in_del > 0 { in_del -= 1; }
+                in_del = in_del.saturating_sub(1);
             }
             // ---- 変更履歴: ins（挿入済みは採用）----
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"ins" => {
                 in_ins += 1;
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"ins" => {
-                if in_ins > 0 { in_ins -= 1; }
+                in_ins = in_ins.saturating_sub(1);
             }
 
             // ---- 画像メタデータ（wp:docPr）----
@@ -554,7 +554,7 @@ fn parse_document_xml(
 
                     let heading_level = style.as_deref()
                         .and_then(|s| config.heading_level_for_style(s))
-                        .or_else(|| {
+                        .or({
                             if (ppr_ul && config.ppr_underline_as_heading)
                                 || (run_ul && config.run_underline_as_heading) {
                                 Some(1)
@@ -598,7 +598,7 @@ fn parse_document_xml(
                         //
                         // 安全性: while ループ内の stack.pop() は直前の last() が Some を
                         //   返したことを確認してから呼ぶため、unwrap() でパニックしない。
-                        while stack.last().map_or(false, |(l, _)| *l >= level) {
+                        while stack.last().is_some_and(|(l, _)| *l >= level) {
                             let (_, finished) = stack.pop()
                                 .expect("stack.last() が Some だったため pop は Some を返す");
                             push_to_parent(&mut stack, &mut root_sections, finished);
@@ -761,7 +761,7 @@ fn is_ordered_numfmt(fmt: &str) -> bool {
 
 /// セクションを適切な親に追加する
 fn push_to_parent(
-    stack: &mut Vec<(usize, Section)>,
+    stack: &mut [(usize, Section)],
     root: &mut Vec<Section>,
     section: Section,
 ) {
@@ -774,7 +774,7 @@ fn push_to_parent(
 
 /// XML要素から属性値を取得する（名前空間プレフィックスを無視）
 fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    let local = name.split(':').last().unwrap_or(name);
+    let local = name.split(':').next_back().unwrap_or(name);
     for attr in e.attributes().flatten() {
         let key = attr.key.local_name();
         if key.as_ref() == local.as_bytes() {

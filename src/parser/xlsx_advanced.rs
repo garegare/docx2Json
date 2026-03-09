@@ -153,7 +153,7 @@ fn build_section(
     apply_merge_cells(&mut data);
 
     // B: Section 生成（書式ベース or 従来フラット）
-    let mut section = if config.xlsx_heading.as_ref().map_or(false, |h| h.enabled) {
+    let mut section = if config.xlsx_heading.as_ref().is_some_and(|h| h.enabled) {
         let hcfg = config.xlsx_heading.as_ref().unwrap();
         build_section_with_headings(name, &data, styles, hcfg, config.xlsx_max_rows)
     } else {
@@ -206,7 +206,7 @@ fn build_section_flat(name: &str, grid: Vec<Vec<String>>, max_rows: usize) -> Se
     // 行数超過: ヘッダー保持で子 Section に分割
     let header = grid[0].clone();
     let data_rows = &grid[1..];
-    let chunk_count = (data_row_count + max_rows - 1) / max_rows;
+    let chunk_count = data_row_count.div_ceil(max_rows);
 
     let children: Vec<Section> = data_rows
         .chunks(max_rows)
@@ -341,7 +341,7 @@ fn build_section_with_headings(
                 }
             } else {
                 // 行数超過: チャンク分割して孫 Section を生成
-                let chunk_count = (data_rows.len() + max_rows - 1) / max_rows;
+                let chunk_count = data_rows.len().div_ceil(max_rows);
                 let chunk_children: Vec<Section> = data_rows
                     .chunks(max_rows)
                     .enumerate()
@@ -861,9 +861,9 @@ fn parse_styles(archive: &mut ZipArchive<File>) -> Result<XlsxStyles> {
     let cell_styles = xf_records
         .iter()
         .map(|&(font_id, fill_id)| CellStyleInfo {
-            bold: fonts.get(font_id).map_or(false, |f| f.bold),
+            bold: fonts.get(font_id).is_some_and(|f| f.bold),
             font_size: fonts.get(font_id).map_or(0.0, |f| f.font_size),
-            has_fill: fills.get(fill_id).map_or(false, |f| f.has_fill),
+            has_fill: fills.get(fill_id).is_some_and(|f| f.has_fill),
         })
         .collect();
 
@@ -884,7 +884,7 @@ fn parse_sheet_drawings(
     // sheet_path: "xl/worksheets/sheet1.xml"
     // → rels_path: "xl/worksheets/_rels/sheet1.xml.rels"
     let file_name = sheet_path.rsplit('/').next().unwrap_or("");
-    let dir = sheet_path.rsplitn(2, '/').nth(1).unwrap_or("xl/worksheets");
+    let dir = sheet_path.rsplit_once('/').map(|x| x.0).unwrap_or("xl/worksheets");
     let rels_path = format!("{}/_rels/{}.rels", dir, file_name);
 
     // シート rels を解析して Drawing ファイルのパスを取得
