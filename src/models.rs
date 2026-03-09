@@ -7,8 +7,20 @@ pub struct Document {
     pub sections: Vec<Section>,
 }
 
+/// セクションに付与されるメタデータ。AI タグ等の追加情報を格納する。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SectionMetadata {
+    /// AI が付与したタグの配列。初期値は空配列。
+    #[serde(default)]
+    pub ai_tags: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Section {
+    /// 文書タイトル + context_path を連結した文字列の FNV-1a 16進数ハッシュ。
+    /// 実行間で安定した ID として使用する（追加クレート不要）。
+    #[serde(default)]
+    pub id: String,
     /// このセクション自身の見出しを含む、ルートからの見出しパスリスト。
     /// RAG でチャンク分割した後も文書内の位置を保持するために使用する。
     /// 例: ["第1章 導入", "1.1 背景", "1.1.1 詳細"]
@@ -17,6 +29,23 @@ pub struct Section {
     pub body_text: String,
     pub assets: Vec<Asset>,
     pub children: Vec<Section>,
+    /// AI タグ等のメタデータ。初期値: { ai_tags: [] }
+    #[serde(default)]
+    pub metadata: SectionMetadata,
+}
+
+impl Default for Section {
+    fn default() -> Self {
+        Section {
+            id: String::new(),
+            context_path: Vec::new(),
+            heading: String::new(),
+            body_text: String::new(),
+            assets: Vec::new(),
+            children: Vec::new(),
+            metadata: SectionMetadata::default(),
+        }
+    }
 }
 
 /// 画像等のバイナリアセット。
