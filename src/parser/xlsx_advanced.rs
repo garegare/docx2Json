@@ -856,16 +856,196 @@ fn parse_styles(archive: &mut ZipArchive<File>) -> Result<XlsxStyles> {
     Ok(XlsxStyles { cell_styles })
 }
 
-/// シートに関連付けられた Drawing ファイルからテキストを抽出する（Phase 3 で本実装）
+/// シートに関連付けられた Drawing ファイルからテキストを抽出する（Phase 3 本実装）
 ///
-/// Phase 2 では空ベクターを返すスタブ。
+/// 処理フロー:
+/// 1. `xl/worksheets/_rels/sheet*.xml.rels` を解析して Drawing のパスを取得
+/// 2. `xl/drawings/drawing*.xml` の `<xdr:sp>` 内 `<a:t>` テキストを収集
+/// 3. 各テキストボックスのテキストをひとつの文字列にまとめて返す
 fn parse_sheet_drawings(
-    _archive: &mut ZipArchive<File>,
-    _sheet_path: &str,
+    archive: &mut ZipArchive<File>,
+    sheet_path: &str,
     _sheet_idx: usize,
 ) -> Result<Vec<String>> {
-    // TODO Phase 3: xl/worksheets/_rels/sheet*.xml.rels → xl/drawings/drawing*.xml を解析
-    Ok(Vec::new())
+    // sheet_path: "xl/worksheets/sheet1.xml"
+    // → rels_path: "xl/worksheets/_rels/sheet1.xml.rels"
+    let file_name = sheet_path.rsplit('/').next().unwrap_or("");
+    let dir = sheet_path.rsplitn(2, '/').nth(1).unwrap_or("xl/worksheets");
+    let rels_path = format!("{}/_rels/{}.rels", dir, file_name);
+
+    // シート rels を解析して Drawing ファイルのパスを取得
+    let drawing_paths = parse_sheet_rels(archive, &rels_path, dir)?;
+    if drawing_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // 各 Drawing ファイルからテキストを収集
+    let mut results = Vec::new();
+    for drawing_path in drawing_paths {
+        match parse_drawing(archive, &drawing_path) {
+            Ok(text) if !text.is_empty() => results.push(text),
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("Warning: Drawing の解析に失敗しました ({drawing_path}): {e}");
+            }
+        }
+    }
+    Ok(results)
+}
+
+/// シートのリレーションシップファイルを解析して Drawing のパスを返す
+///
+/// `Type` 属性が `"...drawing"` で終わるリレーションシップを抽出し、
+/// `Target` を ZIP 内絶対パスに解決する。
+fn parse_sheet_rels(
+    archive: &mut ZipArchive<File>,
+    rels_path: &str,
+    base_dir: &str,
+) -> Result<Vec<String>> {
+    let content = match read_zip_entry(archive, rels_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(Vec::new()), // rels ファイルが存在しない場合は空リスト
+    };
+
+    let mut drawing_paths = Vec::new();
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    loop {
+        match reader.read_event()? {
+            Event::Empty(e) | Event::Start(e)
+                if e.local_name().as_ref() == b"Relationship" =>
+            {
+                let mut rel_type = String::new();
+                let mut target = String::new();
+                for attr in e.attributes().flatten() {
+                    match attr.key.local_name().as_ref() {
+                        b"Type" => rel_type = decode_bytes(&attr.value),
+                        b"Target" => target = decode_bytes(&attr.value),
+                        _ => {}
+                    }
+                }
+                // Type が "drawing" で終わるリレーションシップを収集
+                if rel_type.ends_with("/drawing") && !target.is_empty() {
+                    let path = resolve_rel_target(&target, base_dir);
+                    drawing_paths.push(path);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(drawing_paths)
+}
+
+/// Drawing XML（`xl/drawings/drawing*.xml`）を解析して
+/// テキストボックス（`<xdr:sp>`）内のテキストを収集する
+///
+/// ```xml
+/// <xdr:wsDr>
+///   <xdr:twoCellAnchor>
+///     <xdr:sp>
+///       <xdr:txBody>
+///         <a:p><a:r><a:t>テキスト</a:t></a:r></a:p>
+///       </xdr:txBody>
+///     </xdr:sp>
+///   </xdr:twoCellAnchor>
+/// </xdr:wsDr>
+/// ```
+fn parse_drawing(archive: &mut ZipArchive<File>, path: &str) -> Result<String> {
+    let content = read_zip_entry(archive, path)?;
+    let mut reader = Reader::from_str(&content);
+    reader.config_mut().trim_text(false);
+
+    let mut text_boxes: Vec<String> = Vec::new();
+    let mut in_sp = false;       // <xdr:sp> 内
+    let mut in_tx_body = false;  // <xdr:txBody> 内
+    let mut in_a_t = false;      // <a:t> 内
+    let mut current_box = String::new();
+    let mut current_para = String::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(e) => match e.local_name().as_ref() {
+                b"sp" => {
+                    in_sp = true;
+                    current_box.clear();
+                }
+                b"txBody" if in_sp => {
+                    in_tx_body = true;
+                }
+                b"p" if in_tx_body => {
+                    current_para.clear();
+                }
+                b"t" if in_tx_body => {
+                    in_a_t = true;
+                }
+                _ => {}
+            },
+            Event::Empty(e) => {
+                // <a:br/> など改行要素
+                if in_tx_body && e.local_name().as_ref() == b"br" {
+                    current_para.push('\n');
+                }
+            }
+            Event::End(e) => match e.local_name().as_ref() {
+                b"sp" => {
+                    let trimmed = current_box.trim().to_string();
+                    if !trimmed.is_empty() {
+                        text_boxes.push(trimmed);
+                    }
+                    in_sp = false;
+                    in_tx_body = false;
+                }
+                b"txBody" => {
+                    in_tx_body = false;
+                }
+                b"p" if in_tx_body => {
+                    let para = current_para.trim().to_string();
+                    if !para.is_empty() {
+                        if !current_box.is_empty() {
+                            current_box.push('\n');
+                        }
+                        current_box.push_str(&para);
+                    }
+                    current_para.clear();
+                }
+                b"t" => {
+                    in_a_t = false;
+                }
+                _ => {}
+            },
+            Event::Text(e) if in_a_t => {
+                current_para.push_str(&e.unescape().unwrap_or_default());
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(text_boxes.join("\n\n"))
+}
+
+/// リレーションシップの Target パスを ZIP 内絶対パスに解決する
+///
+/// - `"../drawings/drawing1.xml"` + base `"xl/worksheets"` → `"xl/drawings/drawing1.xml"`
+/// - `"/xl/drawings/drawing1.xml"` → `"xl/drawings/drawing1.xml"` (先頭スラッシュ除去)
+fn resolve_rel_target(target: &str, base_dir: &str) -> String {
+    if target.starts_with('/') {
+        return target.trim_start_matches('/').to_string();
+    }
+    // 相対パスを解決: base_dir から "../" を遡って解決
+    let mut parts: Vec<&str> = base_dir.split('/').collect();
+    for segment in target.split('/') {
+        match segment {
+            ".." => {
+                parts.pop();
+            }
+            "." => {}
+            s => parts.push(s),
+        }
+    }
+    parts.join("/")
 }
 
 // ============================================================
