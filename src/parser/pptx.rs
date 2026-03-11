@@ -286,8 +286,8 @@ fn collect_assets(
             Ok(b) => b,
             Err(_) => continue,
         };
-        let data = if config.image_max_px > 0 {
-            resize_and_compress(&buf, config.image_max_px, config.image_quality)
+        let data = if config.image.max_px > 0 {
+            resize_and_compress(&buf, config.image.max_px, config.image.quality)
                 .unwrap_or(buf)
         } else {
             buf

@@ -77,10 +77,7 @@ document.json   →   →  inject-tags             ←  AI (タグ付与)
 # 開発ビルド
 cargo build
 
-# 実行例（サブコマンドなし = 後方互換の parse として動作）
-cargo run -- --input ./docs --output ./out
-
-# 明示的に parse サブコマンドを指定
+# parse サブコマンド（明示）
 cargo run -- parse --input ./docs --output ./out
 
 # 単一ファイル（.docx / .xlsx / .pptx いずれも対応）
@@ -99,9 +96,21 @@ cargo run -- parse --input ./docs --output ./out --image-max-px 1024
 # XLSXの大きな表を100行ずつ子Sectionに分割
 cargo run -- parse --input ./sheets --output ./out --xlsx-max-rows 100
 
-# 神エクセル対応（設定ファイルで xlsx_heading.enabled: true を指定）
+# 神エクセル対応（設定ファイルで xlsx.heading.enabled: true を指定）
 cargo run -- parse --input ./god-excel.xlsx --output ./out --config ./my-config.json
 ```
+
+### `parse` サブコマンド CLI オプション一覧
+
+| オプション | 短縮形 | デフォルト | 設定ファイル対応 | 説明 |
+| :--- | :---: | :--- | :---: | :--- |
+| `--input <PATH>` | `-i` | `.`（カレント） | — | 入力ファイルまたはディレクトリ |
+| `--output <PATH>` | `-o` | 入力と同じ場所 | — | 出力ディレクトリ |
+| `--config <PATH>` | — | 自動探索 | — | 設定ファイル（`docx2json.json`）のパス |
+| `--split <LEVEL>` | — | 無効 | — | セクション分割の深さ（RAG 向け個別 JSON 出力） |
+| `--image-max-px <N>` | — | `0`（無効） | `image.max_px` | 画像の最大辺長（px）。設定ファイルより優先 |
+| `--image-quality <Q>` | — | `80` | `image.quality` | JPEG 品質（1〜100）。設定ファイルより優先 |
+| `--xlsx-max-rows <N>` | — | `0`（無効） | `xlsx.max_rows` | XLSX シートの最大行数。設定ファイルより優先 |
 
 ### AI・ワークフロー連携コマンド
 
@@ -146,55 +155,78 @@ docx2json summarize \
 
 ## ⚙️ 設定ファイル（`docx2json.json`）
 
-入力ディレクトリに `docx2json.json` を置くことで見出し検出をカスタマイズできます。
+入力ディレクトリに `docx2json.json` を置くことでパース動作をカスタマイズできます。
 設定ファイルが存在しない場合はデフォルト設定が使用されます。
+
+設定は **`docx`（DOCX設定）・`image`（画像設定）・`xlsx`（XLSX設定）** の3つのセクションに分かれています。
+各セクションは省略可能で、省略した場合はデフォルト値が使用されます。
 
 ```json
 {
-  "heading_styles": {
-    "Heading1": 1,
-    "Heading2": 2,
-    "Heading3": 3,
-    "見出し1": 1,
-    "見出し2": 2,
-    "見出し3": 3,
-    "prefix:第": 1,
-    "regex:^\\d+\\.": 2
+  "docx": {
+    "heading_styles": {
+      "Heading1": 1,
+      "Heading2": 2,
+      "Heading3": 3,
+      "見出し1": 1,
+      "見出し2": 2,
+      "見出し3": 3,
+      "prefix:第": 1,
+      "regex:^\\d+\\.": 2
+    },
+    "ppr_underline_as_heading": true,
+    "run_underline_as_heading": false
   },
-  "ppr_underline_as_heading": true,
-  "run_underline_as_heading": false,
-  "image_max_px": 1024,
-  "image_quality": 80,
-  "xlsx_max_rows": 100
+  "image": {
+    "max_px": 1024,
+    "quality": 80
+  },
+  "xlsx": {
+    "max_rows": 100
+  }
 }
 ```
 
-### 設定項目
+### 設定セクション一覧
+
+#### `docx` — DOCX パーサー設定
 
 | キー | デフォルト | 説明 |
 | :--- | :--- | :--- |
 | `heading_styles` | 標準スタイル名セット | `スタイル名: レベル` のマッピング。Heading1〜3・見出し1〜3を既定で認識。キー記法は下表参照。 |
-| `ppr_underline_as_heading` | `true` | 段落デフォルト書式（`w:pPr > w:rPr`）の下線を見出しとして扱う。 |
-| `run_underline_as_heading` | `false` | ランレベル（`w:r > w:rPr`）の下線を見出しとして扱う。Wordの「見出し」スタイルを使わず直接書式で見出しを表現した文書向け。 |
-| `image_max_px` | `0`（無効） | 画像の最大辺長（px）。超過する画像をリサイズし JPEG 再エンコード。`--image-max-px` CLI 引数が優先。 |
-| `image_quality` | `80` | JPEG 再エンコード品質（1〜100）。`image_max_px > 0` のときのみ有効。`--image-quality` CLI 引数が優先。 |
-| `xlsx_max_rows` | `0`（無効） | XLSXシートの最大データ行数。超過した場合ヘッダー行を引き継いだ子Sectionに分割。`--xlsx-max-rows` CLI 引数が優先。 |
-| `xlsx_heading` | `null`（無効） | 神エクセル対応の書式ベース見出し判定設定。`enabled: true` で有効化。詳細は下表参照。 |
+| `ppr_underline_as_heading` | `true` | 段落デフォルト書式（`w:pPr > w:rPr`）の下線を見出し（level 1）として扱う。 |
+| `run_underline_as_heading` | `false` | ランレベル（`w:r > w:rPr`）の下線を見出し（level 1）として扱う。Wordの「見出し」スタイルを使わず直接書式で見出しを表現した文書向け。 |
 
-### `xlsx_heading` 設定（#10 神エクセル対応）
+#### `image` — 画像処理設定
 
-セル結合の展開と浮遊テキストボックス抽出は `xlsx_heading` の設定に関わらず**常に実行**されます。
+| キー | デフォルト | CLI 引数 | 説明 |
+| :--- | :--- | :--- | :--- |
+| `max_px` | `0`（無効） | `--image-max-px` | 画像の最大辺長（px）。超過する画像をリサイズし JPEG 再エンコード。CLI 引数が優先。 |
+| `quality` | `80` | `--image-quality` | JPEG 再エンコード品質（1〜100）。`max_px > 0` のときのみ有効。CLI 引数が優先。 |
+
+#### `xlsx` — XLSX パーサー設定
+
+| キー | デフォルト | CLI 引数 | 説明 |
+| :--- | :--- | :--- | :--- |
+| `max_rows` | `0`（無効） | `--xlsx-max-rows` | XLSXシートの最大データ行数。超過した場合ヘッダー行を引き継いだ子Sectionに分割。CLI 引数が優先。 |
+| `heading` | `null`（無効） | — | 神エクセル対応の書式ベース見出し判定設定。`enabled: true` で有効化。詳細は下表参照。 |
+
+### `xlsx.heading` — 神エクセル対応設定（#10）
+
+セル結合の展開と浮遊テキストボックス抽出は `xlsx.heading` の設定に関わらず**常に実行**されます。
 書式ベースの見出し判定のみ `enabled: true` が必要です。
 
 ```json
 {
-  "xlsx_max_rows": 100,
-  "xlsx_heading": {
-    "enabled": true,
-    "detect_bold": true,
-    "detect_fill": true,
-    "heading_font_size_threshold": 0.0,
-    "heading_cell_ratio": 0.5
+  "xlsx": {
+    "max_rows": 100,
+    "heading": {
+      "enabled": true,
+      "detect_bold": true,
+      "detect_fill": true,
+      "heading_font_size_threshold": 0.0,
+      "heading_cell_ratio": 0.5
+    }
   }
 }
 ```
@@ -211,10 +243,10 @@ docx2json summarize \
 
 | モード | 使用パーサー | セル結合 | 書式見出し | Drawingテキスト |
 | :--- | :--- | :---: | :---: | :---: |
-| `xlsx_heading` なし / `enabled: false` | `xlsx.rs`（従来） | ❌ | ❌ | ❌ |
+| `xlsx.heading` なし / `enabled: false` | `xlsx.rs`（従来） | ❌ | ❌ | ❌ |
 | `enabled: true` | `xlsx_advanced.rs` | ✅ | ✅ | ✅ |
 
-### `heading_styles` キー記法
+### `docx.heading_styles` キー記法
 
 | 記法 | 例 | マッチ条件 |
 | :--- | :--- | :--- |

@@ -19,6 +19,25 @@ struct Cli {
     command: Option<Commands>,
 
     // ---- 後方互換: サブコマンドなしのとき parse として動作するオプション群 ----
+    #[command(flatten)]
+    args: ParseArgs,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// DOCX/XLSX/PPTX ファイルをパースして document.json を生成する（デフォルト動作と同一）
+    Parse(ParseArgs),
+    /// document.json から LLM 向け候補テキストを JSONL 形式で抽出する
+    ExtractCandidates(commands::extract_candidates::Args),
+    /// セクションに AI タグを注入してバリデーションする
+    InjectTags(commands::inject_tags::Args),
+    /// 複数の document.json からタグ使用統計を集計する
+    Summarize(commands::summarize::Args),
+}
+
+/// `parse` サブコマンド（またはサブコマンドなし時の後方互換）の引数
+#[derive(Args)]
+struct ParseArgs {
     /// 入力ディレクトリまたはファイル（.docx / .xlsx / .pptx を再帰的にスキャン）
     #[arg(short, long, default_value = ".")]
     input: PathBuf,
@@ -37,58 +56,16 @@ struct Cli {
     split: Option<usize>,
 
     /// 画像の最大辺長（ピクセル）。超過する画像をこのサイズにリサイズし JPEG 再エンコードする。
+    /// 設定ファイルの `image.max_px` より優先される。
     #[arg(long, value_name = "PIXELS")]
     image_max_px: Option<u32>,
 
-    /// JPEG 再エンコード品質（1〜100）
+    /// JPEG 再エンコード品質（1〜100）。設定ファイルの `image.quality` より優先される。
     #[arg(long, value_name = "QUALITY")]
     image_quality: Option<u8>,
 
-    /// XLSX 1シートあたりの最大データ行数（超過時に子 Section に分割）
-    #[arg(long, value_name = "ROWS")]
-    xlsx_max_rows: Option<usize>,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// DOCX/XLSX ファイルをパースして document.json を生成する（デフォルト動作と同一）
-    Parse(ParseArgs),
-    /// document.json から LLM 向け候補テキストを JSONL 形式で抽出する
-    ExtractCandidates(commands::extract_candidates::Args),
-    /// セクションに AI タグを注入してバリデーションする
-    InjectTags(commands::inject_tags::Args),
-    /// 複数の document.json からタグ使用統計を集計する
-    Summarize(commands::summarize::Args),
-}
-
-/// `parse` サブコマンドの引数（後方互換オプションと同一）
-#[derive(Args)]
-struct ParseArgs {
-    /// 入力ディレクトリまたはファイル（.docx / .xlsx / .pptx を再帰的にスキャン）
-    #[arg(short, long, default_value = ".")]
-    input: PathBuf,
-
-    /// 出力ディレクトリ（省略時は入力ファイルと同じ場所に出力）
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-
-    /// 設定ファイルのパス（省略時は入力ディレクトリ内の docx2json.json を自動検索）
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// セクション単位のチャンク分割レベル（RAG 向け）
-    #[arg(long, value_name = "LEVEL")]
-    split: Option<usize>,
-
-    /// 画像の最大辺長（ピクセル）
-    #[arg(long, value_name = "PIXELS")]
-    image_max_px: Option<u32>,
-
-    /// JPEG 再エンコード品質（1〜100）
-    #[arg(long, value_name = "QUALITY")]
-    image_quality: Option<u8>,
-
-    /// XLSX 1シートあたりの最大データ行数
+    /// XLSX 1シートあたりの最大データ行数（超過時に子 Section に分割）。
+    /// 設定ファイルの `xlsx.max_rows` より優先される。
     #[arg(long, value_name = "ROWS")]
     xlsx_max_rows: Option<usize>,
 }
@@ -99,16 +76,7 @@ fn main() {
     match cli.command {
         None => {
             // 後方互換: サブコマンドなし → parse として動作
-            let args = ParseArgs {
-                input: cli.input,
-                output: cli.output,
-                config: cli.config,
-                split: cli.split,
-                image_max_px: cli.image_max_px,
-                image_quality: cli.image_quality,
-                xlsx_max_rows: cli.xlsx_max_rows,
-            };
-            run_parse(args);
+            run_parse(cli.args);
         }
         Some(Commands::Parse(args)) => {
             run_parse(args);
@@ -144,9 +112,9 @@ fn run_parse(args: ParseArgs) {
     };
     let mut cfg = config::Config::load(args.config.as_deref(), &input_dir);
     // CLI 引数で設定を上書き（設定ファイルより優先）
-    if let Some(px) = args.image_max_px    { cfg.image_max_px = px; }
-    if let Some(q)  = args.image_quality   { cfg.image_quality = q.clamp(1, 100); }
-    if let Some(r)  = args.xlsx_max_rows   { cfg.xlsx_max_rows = r; }
+    if let Some(px) = args.image_max_px    { cfg.image.max_px = px; }
+    if let Some(q)  = args.image_quality   { cfg.image.quality = q.clamp(1, 100); }
+    if let Some(r)  = args.xlsx_max_rows   { cfg.xlsx.max_rows = r; }
 
     // 出力ディレクトリを作成
     if let Some(ref out) = args.output {
@@ -244,7 +212,7 @@ fn format_elapsed(dur: std::time::Duration) -> String {
     }
 }
 
-/// ディレクトリを再帰的にスキャンして .docx/.xlsx ファイルを返す
+/// ディレクトリを再帰的にスキャンして .docx/.xlsx/.pptx ファイルを返す
 fn collect_files(dir: &std::path::Path) -> Vec<PathBuf> {
     if dir.is_file() {
         let ext = dir.extension().and_then(|e| e.to_str()).unwrap_or("");

@@ -13,7 +13,7 @@ use crate::models::{Document, Section};
 
 /// XLSXファイルを解析してDocumentを返す
 ///
-/// 各シートを1つのSectionに変換する。シートのデータ行数が `config.xlsx_max_rows` を
+/// 各シートを1つのSectionに変換する。シートのデータ行数が `config.xlsx.max_rows` を
 /// 超える場合、ヘッダー行を保持したまま子Sectionに分割する。
 pub fn parse(path: &Path, config: &Config) -> Result<Document> {
     let title = path
@@ -54,7 +54,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
 
         match parse_worksheet(&mut archive, &sheet_path, &shared_strings) {
             Ok(grid) => {
-                let section = sheet_to_section(name, grid, config.xlsx_max_rows);
+                let section = sheet_to_section(name, grid, config.xlsx.max_rows);
                 sections.push(section);
             }
             Err(e) => {
