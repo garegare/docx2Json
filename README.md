@@ -98,6 +98,12 @@ cargo run -- parse --input ./sheets --output ./out --xlsx-max-rows 100
 
 # 神エクセル対応（設定ファイルで xlsx.heading.enabled: true を指定）
 cargo run -- parse --input ./god-excel.xlsx --output ./out --config ./my-config.json
+
+# 実効設定を確認（設定ファイル + CLI 引数の適用後の JSON を出力）
+cargo run -- parse --input ./docs --dump-config
+
+# 設定ファイルの雛形を生成
+cargo run -- parse --dump-config > docx2json.json
 ```
 
 ### `parse` サブコマンド CLI オプション一覧
@@ -111,6 +117,7 @@ cargo run -- parse --input ./god-excel.xlsx --output ./out --config ./my-config.
 | `--image-max-px <N>` | — | `0`（無効） | `image.max_px` | 画像の最大辺長（px）。設定ファイルより優先 |
 | `--image-quality <Q>` | — | `80` | `image.quality` | JPEG 品質（1〜100）。設定ファイルより優先 |
 | `--xlsx-max-rows <N>` | — | `0`（無効） | `xlsx.max_rows` | XLSX シートの最大行数。設定ファイルより優先 |
+| `--dump-config` | — | — | — | 実効設定（設定ファイル + CLI 引数の適用後）を JSON で出力して終了 |
 
 ### AI・ワークフロー連携コマンド
 

@@ -68,6 +68,11 @@ struct ParseArgs {
     /// 設定ファイルの `xlsx.max_rows` より優先される。
     #[arg(long, value_name = "ROWS")]
     xlsx_max_rows: Option<usize>,
+
+    /// 実効設定（設定ファイル + CLI 引数の適用後）を JSON で標準出力に表示して終了する。
+    /// 設定ファイルの内容確認や `docx2json.json` の雛形生成に利用できる。
+    #[arg(long)]
+    dump_config: bool,
 }
 
 fn main() {
@@ -115,6 +120,18 @@ fn run_parse(args: ParseArgs) {
     if let Some(px) = args.image_max_px    { cfg.image.max_px = px; }
     if let Some(q)  = args.image_quality   { cfg.image.quality = q.clamp(1, 100); }
     if let Some(r)  = args.xlsx_max_rows   { cfg.xlsx.max_rows = r; }
+
+    // --dump-config: 実効設定を JSON 出力して終了
+    if args.dump_config {
+        match serde_json::to_string_pretty(&cfg) {
+            Ok(json) => println!("{}", json),
+            Err(e) => {
+                eprintln!("Error serializing config: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     // 出力ディレクトリを作成
     if let Some(ref out) = args.output {
