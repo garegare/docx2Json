@@ -1,6 +1,6 @@
 /// 神エクセル対応 XLSX パーサー（ロードマップ #10）
 ///
-/// `config.xlsx_heading.enabled == true` のときのみ呼ばれる。
+/// `config.xlsx.heading.enabled == true` のときのみ呼ばれる。
 /// 既存の `xlsx.rs` は一切変更しない。
 ///
 /// ## 実装する3機能
@@ -153,12 +153,12 @@ fn build_section(
     apply_merge_cells(&mut data);
 
     // B: Section 生成（書式ベース or 従来フラット）
-    let mut section = if config.xlsx_heading.as_ref().is_some_and(|h| h.enabled) {
-        let hcfg = config.xlsx_heading.as_ref().unwrap();
-        build_section_with_headings(name, &data, styles, hcfg, config.xlsx_max_rows)
+    let mut section = if config.xlsx.heading.as_ref().is_some_and(|h| h.enabled) {
+        let hcfg = config.xlsx.heading.as_ref().unwrap();
+        build_section_with_headings(name, &data, styles, hcfg, config.xlsx.max_rows)
     } else {
         let grid = to_dense_grid(&data);
-        build_section_flat(name, grid, config.xlsx_max_rows)
+        build_section_flat(name, grid, config.xlsx.max_rows)
     };
 
     // C: 浮遊テキストボックスを body_text に追記（常に実行）

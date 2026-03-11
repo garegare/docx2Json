@@ -81,7 +81,7 @@ fn parse_rels(archive: &mut ZipArchive<BufReader<std::fs::File>>) -> Result<Hash
 /// JSON 出力時に `models::serialize_as_base64` が呼ばれるため、メモリ上の
 /// データ量を元サイズ（Base64比 約75%）に抑えられる。
 ///
-/// config.image_max_px > 0 の場合は長辺をリサイズして JPEG 再エンコードする。
+/// config.image.max_px > 0 の場合は長辺をリサイズして JPEG 再エンコードする。
 fn extract_images(
     archive: &mut ZipArchive<BufReader<std::fs::File>>,
     rels: &HashMap<String, String>,
@@ -94,8 +94,8 @@ fn extract_images(
             entry.read_to_end(&mut buf)?;
 
             // リサイズ・圧縮が有効な場合は画像を処理する
-            let final_buf = if config.image_max_px > 0 {
-                resize_and_compress(&buf, config.image_max_px, config.image_quality)
+            let final_buf = if config.image.max_px > 0 {
+                resize_and_compress(&buf, config.image.max_px, config.image.quality)
                     .unwrap_or(buf) // 変換失敗時は元データをそのまま使用
             } else {
                 buf
@@ -555,8 +555,8 @@ fn parse_document_xml(
                     let heading_level = style.as_deref()
                         .and_then(|s| config.heading_level_for_style(s))
                         .or({
-                            if (ppr_ul && config.ppr_underline_as_heading)
-                                || (run_ul && config.run_underline_as_heading) {
+                            if (ppr_ul && config.docx.ppr_underline_as_heading)
+                                || (run_ul && config.docx.run_underline_as_heading) {
                                 Some(1)
                             } else {
                                 None
