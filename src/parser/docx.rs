@@ -10,6 +10,7 @@ use zip::ZipArchive;
 
 use crate::config::Config;
 use crate::models::{Asset, Document, Section};
+use super::emf;
 
 /// DOCXファイルを解析してDocumentを返す
 pub fn parse(path: &Path, config: &Config) -> Result<Document> {
@@ -93,8 +94,17 @@ fn extract_images(
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
 
+            // EMF 形式の場合: Windows のみ PNG に変換、非 Windows はスキップ
+            let final_buf = if emf::is_emf(&buf) {
+                match emf::emf_to_png(&buf) {
+                    Some(png) => png,
+                    None => {
+                        eprintln!("  (EMF 画像はこのプラットフォームではスキップ: {})", zip_path);
+                        continue;
+                    }
+                }
             // リサイズ・圧縮が有効な場合は画像を処理する
-            let final_buf = if config.image.max_px > 0 {
+            } else if config.image.max_px > 0 {
                 resize_and_compress(&buf, config.image.max_px, config.image.quality)
                     .unwrap_or(buf) // 変換失敗時は元データをそのまま使用
             } else {

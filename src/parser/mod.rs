@@ -1,4 +1,5 @@
 pub mod docx;
+pub mod emf;
 pub mod pptx;
 pub mod xlsx;
 pub mod xlsx_advanced;
