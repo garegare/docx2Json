@@ -89,7 +89,7 @@ impl Default for DocxConfig {
 }
 
 /// XLSX パーサー設定
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct XlsxConfig {
     /// 1シートあたりの最大データ行数（ヘッダー行を除く）。
     /// 超過した場合、ヘッダー行を引き継いだ子 Section に分割する。
@@ -104,14 +104,6 @@ pub struct XlsxConfig {
     pub heading: Option<XlsxHeadingConfig>,
 }
 
-impl Default for XlsxConfig {
-    fn default() -> Self {
-        Self {
-            max_rows: 0,
-            heading: None,
-        }
-    }
-}
 
 /// XLSX 書式ベース見出し判定の詳細設定（#10 神エクセル対応）
 ///

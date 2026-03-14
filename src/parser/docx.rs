@@ -10,6 +10,7 @@ use zip::ZipArchive;
 
 use crate::config::Config;
 use crate::models::{Asset, Document, Section};
+use super::emf;
 
 /// DOCXファイルを解析してDocumentを返す
 pub fn parse(path: &Path, config: &Config) -> Result<Document> {
@@ -93,8 +94,17 @@ fn extract_images(
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
 
+            // EMF 形式の場合: Windows のみ PNG に変換、非 Windows はスキップ
+            let final_buf = if emf::is_emf(&buf) {
+                match emf::emf_to_png(&buf) {
+                    Some(png) => png,
+                    None => {
+                        eprintln!("  (EMF 画像はこのプラットフォームではスキップ: {})", zip_path);
+                        continue;
+                    }
+                }
             // リサイズ・圧縮が有効な場合は画像を処理する
-            let final_buf = if config.image.max_px > 0 {
+            } else if config.image.max_px > 0 {
                 resize_and_compress(&buf, config.image.max_px, config.image.quality)
                     .unwrap_or(buf) // 変換失敗時は元データをそのまま使用
             } else {
@@ -240,6 +250,9 @@ fn parse_document_xml(
     let mut current_assets: Vec<Asset> = Vec::new(); // 現在の段落の画像
     let mut drawing_rid: Option<String> = None;     // 処理中の drawing の rId
     let mut drawing_title: Option<String> = None;   // 処理中の drawing のタイトル（wp:docPr から取得）
+    let mut in_mc_fallback: u32 = 0;               // mc:Fallback ネスト深さ（AlternateContent 重複防止）
+    let mut vml_rid: Option<String> = None;        // v:imagedata r:id（VML 画像参照）
+    let mut vml_title: Option<String> = None;      // v:imagedata o:title（VML 画像タイトル）
     let mut in_paragraph = false;
     let mut paragraph_style: Option<String> = None;
 
@@ -480,6 +493,16 @@ fn parse_document_xml(
                 in_ins = in_ins.saturating_sub(1);
             }
 
+            // ---- mc:AlternateContent フォールバック（重複防止）----
+            // mc:Choice 側に a:blip がある場合、mc:Fallback 内の v:imagedata は
+            // スキップして画像の二重追加を防ぐ。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"Fallback" => {
+                in_mc_fallback += 1;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"Fallback" => {
+                in_mc_fallback = in_mc_fallback.saturating_sub(1);
+            }
+
             // ---- 画像メタデータ（wp:docPr）----
             // <wp:docPr id="1" name="図 2" descr="代替テキスト"/>
             // descr（代替テキスト/alt text）を優先し、なければ name を使用
@@ -506,6 +529,30 @@ fn parse_document_xml(
                             asset_type: "image".to_string(),
                             title,
                             data: raw.clone(), // Vec<u8>: Base64 エンコードは出力時に実施
+                        });
+                    }
+                }
+            }
+
+            // ---- VML 画像参照（v:imagedata）----
+            // <v:imagedata r:id="rId5" o:title="図のタイトル"/>
+            // w:pict > v:shape > v:imagedata の形式で埋め込まれたレガシー画像。
+            // mc:Fallback 内は a:blip 側（mc:Choice）で処理済みのためスキップする。
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if e.local_name().as_ref() == b"imagedata" && in_mc_fallback == 0 =>
+            {
+                vml_rid   = attr_value(&e, "id");   // r:id の local name は "id"
+                vml_title = attr_value(&e, "title").filter(|s| !s.trim().is_empty()); // o:title
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"pict" => {
+                // w:pict 終了時に VML 画像を Asset 化
+                let title = vml_title.take().unwrap_or_default();
+                if let Some(rid) = vml_rid.take() {
+                    if let Some(raw) = images.get(&rid) {
+                        current_assets.push(Asset {
+                            asset_type: "image".to_string(),
+                            title,
+                            data: raw.clone(),
                         });
                     }
                 }
