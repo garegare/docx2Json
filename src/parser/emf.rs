@@ -37,7 +37,7 @@ pub fn emf_to_png(emf_bytes: &[u8]) -> Option<Vec<u8>> {
     unsafe {
         // 1. メモリ上の EMF バイト列からハンドルを作成
         let hemf = SetEnhMetaFileBits(emf_bytes.len() as u32, emf_bytes.as_ptr());
-        if hemf == 0 {
+        if hemf.is_null() {
             return None;
         }
 
@@ -71,8 +71,8 @@ pub fn emf_to_png(emf_bytes: &[u8]) -> Option<Vec<u8>> {
         }
 
         // 3. メモリ DC を作成
-        let hdc = CreateCompatibleDC(0);
-        if hdc == 0 {
+        let hdc = CreateCompatibleDC(std::ptr::null_mut());
+        if hdc.is_null() {
             DeleteEnhMetaFile(hemf);
             return None;
         }
@@ -96,8 +96,8 @@ pub fn emf_to_png(emf_bytes: &[u8]) -> Option<Vec<u8>> {
         };
 
         let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let hbitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, 0, 0);
-        if hbitmap == 0 || bits_ptr.is_null() {
+        let hbitmap = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, std::ptr::null_mut(), 0);
+        if hbitmap.is_null() || bits_ptr.is_null() {
             DeleteDC(hdc);
             DeleteEnhMetaFile(hemf);
             return None;
