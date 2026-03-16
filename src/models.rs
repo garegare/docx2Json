@@ -15,6 +15,71 @@ pub struct SectionMetadata {
     pub ai_tags: Vec<String>,
 }
 
+/// 段落・テーブル・アセット参照の意味的役割
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticRole {
+    Heading,
+    Note,
+    Warning,
+    Tip,
+    CodeBlock,
+    InlineCode,
+    Quote,
+    BulletList,
+    OrderedList,
+}
+
+/// 要素に付与されるメタデータ（スタイル・アラインメント・役割・アンカー等）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ElementMetadata {
+    /// Word スタイル名（正規化済み）。例: "Heading1", "Normal"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// Word スタイル名（生値）。style と同じ値だが将来的なカスタムスタイル対応用
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_style: Option<String>,
+    /// 段落の水平配置。"left" / "center" / "right" / "both"（両端揃え）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<String>,
+    /// 段落のアウトラインレベル（1 = 最上位見出し）。w:outlineLvl から 1-based に変換
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outline_level: Option<u32>,
+    /// 意味的役割（SemanticRole）。スタイル名・リスト属性から自動判定
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<SemanticRole>,
+    /// w:bookmarkStart の name 属性から取得したアンカー ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
+    /// asset_ref 要素のキャプション（画像の代替テキストまたは名前）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caption: Option<String>,
+}
+
+/// セクション内の構造化要素
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Element {
+    /// テキスト段落
+    Paragraph {
+        text: String,
+        #[serde(default)]
+        metadata: ElementMetadata,
+    },
+    /// テーブル（Markdown 互換の行列表現）
+    Table {
+        #[serde(default)]
+        metadata: ElementMetadata,
+        rows: Vec<Vec<String>>,
+    },
+    /// 画像等のアセット参照（assets 配列の id と対応）
+    AssetRef {
+        asset_id: String,
+        #[serde(default)]
+        metadata: ElementMetadata,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Section {
     /// 文書タイトル + context_path を連結した文字列の FNV-1a 16進数ハッシュ。
@@ -26,7 +91,13 @@ pub struct Section {
     /// 例: ["第1章 導入", "1.1 背景", "1.1.1 詳細"]
     pub context_path: Vec<String>,
     pub heading: String,
+    /// 後方互換用フラットテキスト（Markdown 形式）。
+    /// 新規コードは elements を参照することを推奨する。
     pub body_text: String,
+    /// 構造化要素配列（paragraph / table / asset_ref）。
+    /// body_text と並行して生成される。
+    #[serde(default)]
+    pub elements: Vec<Element>,
     pub assets: Vec<Asset>,
     pub children: Vec<Section>,
     /// AI タグ等のメタデータ。初期値: { ai_tags: [] }
@@ -43,6 +114,10 @@ pub struct Section {
 pub struct Asset {
     #[serde(rename = "type")]
     pub asset_type: String,
+    /// リレーションシップ ID（rId）。element の asset_ref.asset_id と対応する。
+    /// 旧形式の JSON（id フィールドなし）との互換性のため default を許容する。
+    #[serde(default)]
+    pub id: String,
     pub title: String,
     /// バイナリデータ。JSON では Base64 文字列として出力される。
     #[serde(serialize_with = "serialize_as_base64", deserialize_with = "deserialize_from_base64")]

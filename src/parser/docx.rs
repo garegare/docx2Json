@@ -9,7 +9,7 @@ use quick_xml::reader::Reader;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::models::{Asset, Document, Section};
+use crate::models::{Asset, Document, Element, ElementMetadata, SemanticRole, Section};
 use super::emf;
 
 /// DOCXファイルを解析してDocumentを返す
@@ -255,6 +255,9 @@ fn parse_document_xml(
     let mut vml_title: Option<String> = None;      // v:imagedata o:title（VML 画像タイトル）
     let mut in_paragraph = false;
     let mut paragraph_style: Option<String> = None;
+    let mut para_alignment: Option<String> = None;    // w:jc（段落の水平配置）
+    let mut para_outline_level: Option<u32> = None;   // w:outlineLvl（1-based）
+    let mut para_anchor_id: Option<String> = None;    // w:bookmarkStart の name
 
     // ---- 箇条書きパーサー状態 ----
     let mut in_numpr = false;                    // w:numPr 内か
@@ -349,6 +352,10 @@ fn parse_document_xml(
                             sec.body_text.push('\n');
                         }
                         sec.body_text.push_str(&md);
+                        sec.elements.push(Element::Table {
+                            metadata: ElementMetadata::default(),
+                            rows: table_rows.clone(),
+                        });
                     }
                     table_rows.clear();
                 }
@@ -414,6 +421,9 @@ fn parse_document_xml(
                 para_num_ilvl = 0;
                 current_text.clear();
                 current_assets.clear();
+                para_alignment = None;
+                para_outline_level = None;
+                para_anchor_id = None;
             }
 
             // ---- 段落プロパティ ----
@@ -428,6 +438,33 @@ fn parse_document_xml(
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"pStyle" => {
                 if let Some(val) = attr_value(&e, "w:val").or_else(|| attr_value(&e, "val")) {
                     paragraph_style = Some(val);
+                }
+            }
+
+            // ---- 段落の水平配置（w:jc）----
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"jc" => {
+                if let Some(val) = attr_value(&e, "val") {
+                    para_alignment = Some(val);
+                }
+            }
+
+            // ---- アウトラインレベル（w:outlineLvl）----
+            // Word では 0-based（0 = 見出し1相当）なので +1 して 1-based に変換する
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"outlineLvl" => {
+                if let Some(val) = attr_value(&e, "val") {
+                    para_outline_level = val.parse::<u32>().ok().map(|v| v + 1);
+                }
+            }
+
+            // ---- アンカー ID（w:bookmarkStart）----
+            // _Toc で始まる自動生成の目次ブックマークはスキップする
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"bookmarkStart" => {
+                if para_anchor_id.is_none() {
+                    if let Some(name) = attr_value(&e, "name") {
+                        if !name.starts_with("_Toc") && !name.starts_with("_GoBack") {
+                            para_anchor_id = Some(name);
+                        }
+                    }
                 }
             }
 
@@ -527,6 +564,7 @@ fn parse_document_xml(
                     if let Some(raw) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
+                            id: rid,
                             title,
                             data: raw.clone(), // Vec<u8>: Base64 エンコードは出力時に実施
                         });
@@ -551,6 +589,7 @@ fn parse_document_xml(
                     if let Some(raw) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
+                            id: rid,
                             title,
                             data: raw.clone(),
                         });
@@ -598,6 +637,9 @@ fn parse_document_xml(
                     let run_ul = std::mem::replace(&mut run_underline, false);
                     let num_id = para_num_id.take();
                     let num_ilvl = para_num_ilvl;
+                    let alignment = para_alignment.take();
+                    let outline_level = para_outline_level.take();
+                    let anchor_id = para_anchor_id.take();
 
                     let heading_level = style.as_deref()
                         .and_then(|s| config.heading_level_for_style(s))
@@ -652,6 +694,22 @@ fn parse_document_xml(
                         }
                         stack.push((level, new_section));
                     } else if !body.is_empty() || !assets.is_empty() {
+                        // 意味的役割を判定（箇条書きはリスト役割、それ以外はスタイル名から推定）
+                        let role = if let Some(ref nid) = num_id {
+                            let ordered = numbering
+                                .get(nid)
+                                .and_then(|fmts| fmts.get(num_ilvl as usize))
+                                .map(|fmt| is_ordered_numfmt(fmt))
+                                .unwrap_or(false);
+                            if ordered {
+                                Some(SemanticRole::OrderedList)
+                            } else {
+                                Some(SemanticRole::BulletList)
+                            }
+                        } else {
+                            style.as_deref().and_then(determine_role)
+                        };
+
                         // 箇条書きプレフィックスを付与（numId が設定されている場合）
                         let body = if let Some(ref nid) = num_id {
                             let indent = "  ".repeat(num_ilvl as usize);
@@ -670,12 +728,42 @@ fn parse_document_xml(
                             body
                         };
 
-                        // 現在のセクションの body_text に追加
+                        // 現在のセクションの body_text と elements に追加
                         if let Some((_, sec)) = stack.last_mut() {
                             if !sec.body_text.is_empty() {
                                 sec.body_text.push('\n');
                             }
                             sec.body_text.push_str(&body);
+
+                            // Element::Paragraph を追加
+                            sec.elements.push(Element::Paragraph {
+                                text: body,
+                                metadata: ElementMetadata {
+                                    style: style.clone(),
+                                    raw_style: style,
+                                    alignment,
+                                    outline_level,
+                                    role,
+                                    anchor_id,
+                                    caption: None,
+                                },
+                            });
+
+                            // 画像ごとに Element::AssetRef を追加（段落内の画像位置を保持）
+                            for asset in &assets {
+                                sec.elements.push(Element::AssetRef {
+                                    asset_id: asset.id.clone(),
+                                    metadata: ElementMetadata {
+                                        caption: if asset.title.is_empty() {
+                                            None
+                                        } else {
+                                            Some(asset.title.clone())
+                                        },
+                                        ..Default::default()
+                                    },
+                                });
+                            }
+
                             sec.assets.extend(assets);
                         }
                     }
@@ -816,6 +904,31 @@ fn push_to_parent(
         parent.children.push(section);
     } else {
         root.push(section);
+    }
+}
+
+/// スタイル名から意味的役割（SemanticRole）を推定する
+///
+/// スタイル名に特定のキーワードが含まれる場合に対応する役割を返す。
+/// 見出しスタイルはここでは扱わない（heading_level 判定済みのため）。
+fn determine_role(style: &str) -> Option<SemanticRole> {
+    let lower = style.to_lowercase();
+    if lower.contains("warning") || lower.contains("caution") || lower.contains("alert")
+        || lower.contains("danger")
+    {
+        Some(SemanticRole::Warning)
+    } else if lower.contains("note") || lower.contains("注意") || lower.contains("注記") {
+        Some(SemanticRole::Note)
+    } else if lower.contains("tip") || lower.contains("hint") || lower.contains("ヒント") {
+        Some(SemanticRole::Tip)
+    } else if lower.contains("code") || lower.contains("preformat") || lower.contains("verbatim")
+        || lower.contains("sourcetext")
+    {
+        Some(SemanticRole::CodeBlock)
+    } else if lower.contains("quote") || lower.contains("quotation") || lower.contains("引用") {
+        Some(SemanticRole::Quote)
+    } else {
+        None
     }
 }
 
