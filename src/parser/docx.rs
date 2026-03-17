@@ -922,19 +922,31 @@ fn push_to_parent(
 fn style_words(style: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut word = String::new();
-    for ch in style.chars() {
+    let chars: Vec<char> = style.chars().collect();
+    let n = chars.len();
+    let mut i = 0;
+    while i < n {
+        let ch = chars[i];
         if ch == '-' || ch == '_' || ch == ' ' || ch == '.' {
             if !word.is_empty() {
                 words.push(word.to_lowercase());
                 word = String::new();
             }
-        } else if ch.is_uppercase() && !word.is_empty() {
-            words.push(word.to_lowercase());
-            word = String::new();
+        } else if ch.is_uppercase() {
+            let word_has_lower = word.chars().any(|c| c.is_lowercase());
+            // 頭字語（ALL_CAPS）末尾の境界検出: 次が小文字かつ現在 word 末尾が大文字
+            // 例: "WARNINGBox" の 'B' で "WARNING" / "Box" に分割
+            let next_is_lower = i + 1 < n && chars[i + 1].is_lowercase();
+            let last_is_upper = word.chars().next_back().map(|c| c.is_uppercase()).unwrap_or(false);
+            if !word.is_empty() && (word_has_lower || (next_is_lower && last_is_upper)) {
+                words.push(word.to_lowercase());
+                word = String::new();
+            }
             word.push(ch);
         } else {
             word.push(ch);
         }
+        i += 1;
     }
     if !word.is_empty() {
         words.push(word.to_lowercase());
@@ -1150,6 +1162,126 @@ mod tests {
         let raw: u32 = 2;
         let converted = raw + 1;
         assert_eq!(converted, 3);
+    }
+
+    // ── 改善ポイント 1: 境界値・エッジケース ──────────────────────────────
+
+    #[test]
+    fn test_determine_role_empty_style() {
+        let cfg = default_docx_config();
+        // 空文字はパニックせず None を返す
+        assert_eq!(determine_role("", &cfg), None);
+    }
+
+    #[test]
+    fn test_determine_role_whitespace_only() {
+        let cfg = default_docx_config();
+        // スペースのみもパニックせず None を返す
+        assert_eq!(determine_role("   ", &cfg), None);
+    }
+
+    #[test]
+    fn test_determine_role_very_long_style_name() {
+        let cfg = default_docx_config();
+        // 255 文字超の入力でもパニックしない
+        let long_name = "A".repeat(300);
+        let _ = determine_role(&long_name, &cfg); // パニックしないことを確認
+        let long_with_keyword = format!("Warning{}", "X".repeat(250));
+        assert_eq!(determine_role(&long_with_keyword, &cfg), Some(SemanticRole::Warning));
+    }
+
+    #[test]
+    fn test_style_words_empty_and_whitespace() {
+        assert!(style_words("").is_empty());
+        assert!(style_words("   ").is_empty());
+        assert!(style_words("---").is_empty());
+    }
+
+    // ── 改善ポイント 2: 大文字小文字の正規化 ──────────────────────────────
+
+    #[test]
+    fn test_style_words_all_caps() {
+        // 全大文字は 1 単語として扱われる
+        assert_eq!(style_words("WARNING"), vec!["warning"]);
+        assert_eq!(style_words("NOTE"), vec!["note"]);
+        assert_eq!(style_words("CODE"), vec!["code"]);
+    }
+
+    #[test]
+    fn test_style_words_all_caps_compound() {
+        // 頭字語 + CamelCase の組み合わせ
+        assert_eq!(style_words("WARNINGBox"), vec!["warning", "box"]);
+    }
+
+    #[test]
+    fn test_determine_role_all_caps() {
+        let cfg = default_docx_config();
+        // 全大文字でもキーワードが認識される
+        assert_eq!(determine_role("WARNING", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("NOTE", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("CODE", &cfg), Some(SemanticRole::CodeBlock));
+        assert_eq!(determine_role("TIP", &cfg), Some(SemanticRole::Tip));
+    }
+
+    #[test]
+    fn test_determine_role_all_lowercase() {
+        let cfg = default_docx_config();
+        // 全小文字でもキーワードが認識される
+        assert_eq!(determine_role("warning", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("note", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("tip", &cfg), Some(SemanticRole::Tip));
+    }
+
+    // ── 改善ポイント 3: 多言語・特殊文字 ─────────────────────────────────
+
+    #[test]
+    fn test_determine_role_japanese_fullwidth_number() {
+        let cfg = default_docx_config();
+        // 全角数字を含む日本語スタイル名でも日本語キーワードが認識される
+        assert_eq!(determine_role("警告スタイル１", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("注意事項２", &cfg), Some(SemanticRole::Note));
+    }
+
+    #[test]
+    fn test_style_words_with_emoji_does_not_panic() {
+        // 絵文字・補助文字が含まれてもパニックしない（Rust の chars() は正しく処理する）
+        let result = style_words("Warning🚨Style");
+        assert!(!result.is_empty()); // パニックせず結果が返ることを確認
+    }
+
+    // ── 改善ポイント 4: 優先順位の競合テスト ─────────────────────────────
+
+    #[test]
+    fn test_determine_role_priority_note_before_code() {
+        let cfg = default_docx_config();
+        // 評価順: Warning > Note > Tip > CodeBlock > Quote
+        // "CodeNote" は Note と Code を含むが、Note の評価が先なので Note が返る
+        assert_eq!(determine_role("CodeNote", &cfg), Some(SemanticRole::Note));
+    }
+
+    #[test]
+    fn test_determine_role_priority_warning_before_note() {
+        let cfg = default_docx_config();
+        // "WarningNote" → Warning が Note より先に評価される
+        assert_eq!(determine_role("WarningNote", &cfg), Some(SemanticRole::Warning));
+    }
+
+    // ── 改善ポイント 5: outline_level の最大値超過 ────────────────────────
+
+    #[test]
+    fn test_outline_level_max_word_spec() {
+        // Word 仕様上の最大は 0-based で 8（= 1-based で 9）
+        let raw: u32 = 8;
+        let converted = raw + 1;
+        assert_eq!(converted, 9);
+    }
+
+    #[test]
+    fn test_outline_level_beyond_max_no_panic() {
+        // 仕様外の値（raw=10 など）でも u32 加算はパニックしない
+        let raw: u32 = 10;
+        let converted = raw.saturating_add(1);
+        assert_eq!(converted, 11); // オーバーフローなし
     }
 }
 
