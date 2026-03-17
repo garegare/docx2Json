@@ -33,6 +33,10 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **AI タグ注入・バリデーション** | ✅ | `inject-tags` サブコマンド。セクション ID 指定でタグを注入し `keywords.json` でバリデーション。 |
 | **タグ使用統計集計** | ✅ | `summarize` サブコマンド。複数ドキュメントのタグ使用頻度を横断集計して `tags_summary.json` を生成。 |
 | **PPTXパース** | ✅ | スライド単位で `Section` 化。テキストボックスを Y 座標順に結合し、スライドノートを `[ノート]` として body_text 末尾に付加。画像を `assets` に格納。 |
+| **`elements` 構造化配列** | ✅ | 段落・テーブル・画像参照を順序保持した `elements` 配列で管理。RAG チャンク分割時のセマンティック欠落を防止。 |
+| **意味的役割（SemanticRole）** | ✅ | スタイル名から `Warning` / `Note` / `Tip` / `CodeBlock` / `Quote` 等を自動推定し `elements[].metadata.role` に付与。日本語スタイル名にも対応。 |
+| **カスタム SemanticRole マッピング** | ✅ | `docx.semantic_role_styles` でスタイル名 → SemanticRole を設定ファイルから外部注入可能。 |
+| **出力フィールド制御** | ✅ | `output.include_body_text`（デフォルト: `false`）と `output.include_base64`（デフォルト: `true`）で JSON サイズを最適化。 |
 
 ## 🛠 技術スタック
 | カテゴリ | ライブラリ | 選定理由 |
@@ -165,7 +169,7 @@ docx2json summarize \
 入力ディレクトリに `docx2json.json` を置くことでパース動作をカスタマイズできます。
 設定ファイルが存在しない場合はデフォルト設定が使用されます。
 
-設定は **`docx`（DOCX設定）・`image`（画像設定）・`xlsx`（XLSX設定）** の3つのセクションに分かれています。
+設定は **`docx`・`image`・`xlsx`・`output`** の4つのセクションに分かれています。
 各セクションは省略可能で、省略した場合はデフォルト値が使用されます。
 
 ```json
@@ -182,7 +186,11 @@ docx2json summarize \
       "regex:^\\d+\\.": 2
     },
     "ppr_underline_as_heading": true,
-    "run_underline_as_heading": false
+    "run_underline_as_heading": false,
+    "semantic_role_styles": {
+      "MyCustomAlert": "warning",
+      "SpecialNote": "note"
+    }
   },
   "image": {
     "max_px": 1024,
@@ -190,6 +198,10 @@ docx2json summarize \
   },
   "xlsx": {
     "max_rows": 100
+  },
+  "output": {
+    "include_body_text": false,
+    "include_base64": true
   }
 }
 ```
@@ -203,6 +215,7 @@ docx2json summarize \
 | `heading_styles` | 標準スタイル名セット | `スタイル名: レベル` のマッピング。Heading1〜3・見出し1〜3を既定で認識。キー記法は下表参照。 |
 | `ppr_underline_as_heading` | `true` | 段落デフォルト書式（`w:pPr > w:rPr`）の下線を見出し（level 1）として扱う。 |
 | `run_underline_as_heading` | `false` | ランレベル（`w:r > w:rPr`）の下線を見出し（level 1）として扱う。Wordの「見出し」スタイルを使わず直接書式で見出しを表現した文書向け。 |
+| `semantic_role_styles` | `{}`（空） | スタイル名 → SemanticRole のカスタムマッピング。組み込みルールより優先される。値は `"note"` / `"warning"` / `"tip"` / `"code_block"` / `"quote"` / `"bullet_list"` / `"ordered_list"` のいずれか。 |
 
 #### `image` — 画像処理設定
 
@@ -253,6 +266,13 @@ docx2json summarize \
 | `xlsx.heading` なし / `enabled: false` | `xlsx.rs`（従来） | ❌ | ❌ | ❌ |
 | `enabled: true` | `xlsx_advanced.rs` | ✅ | ✅ | ✅ |
 
+#### `output` — JSON 出力設定
+
+| キー | デフォルト | 説明 |
+| :--- | :--- | :--- |
+| `include_body_text` | `false` | `true` にすると後方互換用フラットテキスト `body_text` を出力。新規利用では `elements` を参照推奨。 |
+| `include_base64` | `true` | `false` にすると画像 Base64 データ（`assets[].data`）を省略。JSON サイズを大幅に削減できる。 |
+
 ### `docx.heading_styles` キー記法
 
 | 記法 | 例 | マッチ条件 |
@@ -281,10 +301,27 @@ docx2json summarize \
       "id": "fac9d8c798625bae",
       "context_path": ["第1章 導入"],
       "heading": "第1章 導入",
-      "body_text": "セクション内の連続する段落を結合したテキスト。\n\n| 項目 | 値 |\n|------|----|\n| A | 1 |",
+      "elements": [
+        {
+          "type": "paragraph",
+          "text": "セクション内の段落テキスト。",
+          "metadata": { "role": "note", "alignment": "left" }
+        },
+        {
+          "type": "table",
+          "rows": [["項目", "値"], ["A", "1"]],
+          "metadata": {}
+        },
+        {
+          "type": "asset_ref",
+          "asset_id": "rId5",
+          "metadata": {}
+        }
+      ],
       "assets": [
         {
           "type": "image",
+          "id": "rId5",
           "title": "図1 構成図",
           "data": "iVBORw0KGgoAAAANSUhEUgAA..."
         }
@@ -294,7 +331,13 @@ docx2json summarize \
           "id": "581702679c106bbd",
           "context_path": ["第1章 導入", "1.1 背景"],
           "heading": "1.1 背景",
-          "body_text": "サブセクションのテキスト。",
+          "elements": [
+            {
+              "type": "paragraph",
+              "text": "サブセクションのテキスト。",
+              "metadata": {}
+            }
+          ],
           "assets": [],
           "children": [],
           "metadata": {
@@ -311,7 +354,13 @@ docx2json summarize \
 ```
 
 - **`id`**: 文書タイトル + context_path を連結した FNV-1a 64bit ハッシュ（16文字 16進数）。実行間で安定。
-- **`metadata.ai_tags`**: `inject-tags` で注入された AI タグ。初期値は空配列。`#[serde(default)]` により既存 JSON との後方互換性を維持。
+- **`elements`**: 段落・テーブル・画像参照を出現順で保持する配列。`type` フィールドで種別を識別。
+  - `paragraph`: テキスト段落。`metadata.role` に SemanticRole（`warning` / `note` / `tip` / `code_block` / `quote` 等）が付与される場合がある。
+  - `table`: テーブル。`rows` は `string[][]` の2次元配列。
+  - `asset_ref`: 画像参照。`asset_id` が `assets[].id` に対応。
+- **`body_text`**: 後方互換用フラットテキスト。`output.include_body_text: true` を設定した場合のみ出力（デフォルト: 出力しない）。
+- **`assets[].data`**: Base64 エンコードされた画像データ。`output.include_base64: false` で省略可能（デフォルト: 出力する）。
+- **`metadata.ai_tags`**: `inject-tags` で注入された AI タグ。初期値は空配列。
 
 ### `candidates.jsonl`（`extract-candidates` コマンドの出力）
 
@@ -360,7 +409,8 @@ src/
 ├── splitter.rs          # --split によるチャンク分割出力
 ├── parser/
 │   ├── mod.rs           # ファイル種別ルーティング + fill_context_path / fill_section_id
-│   ├── docx.rs          # DOCXパーサー（実装済み）
+│   ├── docx.rs          # DOCXパーサー（elements / SemanticRole 対応）
+│   ├── pptx.rs          # PPTXパーサー（スライド単位 Section 化）
 │   ├── xlsx.rs          # XLSXパーサー（従来モード・後方互換）
 │   └── xlsx_advanced.rs # 神エクセル対応パーサー（セル結合・書式見出し・Drawing）
 └── commands/
