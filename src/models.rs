@@ -16,15 +16,16 @@ pub struct SectionMetadata {
 }
 
 /// 段落・テーブル・アセット参照の意味的役割
+///
+/// Note: `Heading` は Section ツリーで表現するため Element には現れない。
+/// `InlineCode` はパーサーが未対応のため将来拡張用として予約済み。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticRole {
-    Heading,
     Note,
     Warning,
     Tip,
     CodeBlock,
-    InlineCode,
     Quote,
     BulletList,
     OrderedList,
@@ -115,9 +116,10 @@ pub struct Asset {
     #[serde(rename = "type")]
     pub asset_type: String,
     /// リレーションシップ ID（rId）。element の asset_ref.asset_id と対応する。
-    /// 旧形式の JSON（id フィールドなし）との互換性のため default を許容する。
-    #[serde(default)]
-    pub id: String,
+    /// 旧形式の JSON（id フィールドなし）との後方互換のため default を許容する。
+    /// id を持たないアセット（PPTX 画像等）は None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub title: String,
     /// バイナリデータ。JSON では Base64 文字列として出力される。
     #[serde(serialize_with = "serialize_as_base64", deserialize_with = "deserialize_from_base64")]

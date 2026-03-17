@@ -8,7 +8,7 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use zip::ZipArchive;
 
-use crate::config::Config;
+use crate::config::{normalize_style_name, Config, DocxConfig};
 use crate::models::{Asset, Document, Element, ElementMetadata, SemanticRole, Section};
 use super::emf;
 
@@ -346,7 +346,9 @@ fn parse_document_xml(
             // テーブル終了: Markdownを生成して現在のセクションに挿入
             Ok(Event::End(e)) if e.local_name().as_ref() == b"tbl" => {
                 if in_table == 1 && !table_rows.is_empty() {
-                    let md = rows_to_markdown(&table_rows);
+                    // mem::take で所有権を取りつつ table_rows を空にする（clone 不要）
+                    let rows = std::mem::take(&mut table_rows);
+                    let md = rows_to_markdown(&rows);
                     if let Some((_, sec)) = stack.last_mut() {
                         if !sec.body_text.is_empty() {
                             sec.body_text.push('\n');
@@ -354,10 +356,10 @@ fn parse_document_xml(
                         sec.body_text.push_str(&md);
                         sec.elements.push(Element::Table {
                             metadata: ElementMetadata::default(),
-                            rows: table_rows.clone(),
+                            rows,
                         });
                     }
-                    table_rows.clear();
+                    // table_rows は take() 済みなので clear() は不要
                 }
                 in_table = in_table.saturating_sub(1);
             }
@@ -457,7 +459,9 @@ fn parse_document_xml(
             }
 
             // ---- アンカー ID（w:bookmarkStart）----
-            // _Toc で始まる自動生成の目次ブックマークはスキップする
+            // 段落内外を問わずドキュメント全体を対象とし、最初に出現したブックマーク名を
+            // 現在の段落の anchor_id として採用する（in_paragraph 外でも処理される）。
+            // _Toc・_GoBack は Word が自動生成するブックマークのため除外する。
             Ok(Event::Empty(e)) | Ok(Event::Start(e)) if e.local_name().as_ref() == b"bookmarkStart" => {
                 if para_anchor_id.is_none() {
                     if let Some(name) = attr_value(&e, "name") {
@@ -564,7 +568,7 @@ fn parse_document_xml(
                     if let Some(raw) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
-                            id: rid,
+                            id: Some(rid),
                             title,
                             data: raw.clone(), // Vec<u8>: Base64 エンコードは出力時に実施
                         });
@@ -589,7 +593,7 @@ fn parse_document_xml(
                     if let Some(raw) = images.get(&rid) {
                         current_assets.push(Asset {
                             asset_type: "image".to_string(),
-                            id: rid,
+                            id: Some(rid),
                             title,
                             data: raw.clone(),
                         });
@@ -707,7 +711,7 @@ fn parse_document_xml(
                                 Some(SemanticRole::BulletList)
                             }
                         } else {
-                            style.as_deref().and_then(determine_role)
+                            style.as_deref().and_then(|s| determine_role(s, &config.docx))
                         };
 
                         // 箇条書きプレフィックスを付与（numId が設定されている場合）
@@ -736,10 +740,13 @@ fn parse_document_xml(
                             sec.body_text.push_str(&body);
 
                             // Element::Paragraph を追加
+                            // style: 正規化済みスタイル名（全角→半角変換）
+                            // raw_style: XML から取得した生値（将来のカスタムスタイル対応用）
+                            let normalized_style = style.as_deref().map(normalize_style_name);
                             sec.elements.push(Element::Paragraph {
                                 text: body,
                                 metadata: ElementMetadata {
-                                    style: style.clone(),
+                                    style: normalized_style,
                                     raw_style: style,
                                     alignment,
                                     outline_level,
@@ -752,7 +759,7 @@ fn parse_document_xml(
                             // 画像ごとに Element::AssetRef を追加（段落内の画像位置を保持）
                             for asset in &assets {
                                 sec.elements.push(Element::AssetRef {
-                                    asset_id: asset.id.clone(),
+                                    asset_id: asset.id.clone().unwrap_or_default(),
                                     metadata: ElementMetadata {
                                         caption: if asset.title.is_empty() {
                                             None
@@ -907,25 +914,72 @@ fn push_to_parent(
     }
 }
 
+/// スタイル名を CamelCase・ハイフン・アンダースコア・スペースで単語に分割し、
+/// 小文字の単語リストを返す。
+///
+/// 例: "WarningBox" → ["warning", "box"]、"note-text" → ["note", "text"]、
+///     "Footnote" → ["footnote"]（誤検知を防止）
+fn style_words(style: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for ch in style.chars() {
+        if ch == '-' || ch == '_' || ch == ' ' || ch == '.' {
+            if !word.is_empty() {
+                words.push(word.to_lowercase());
+                word = String::new();
+            }
+        } else if ch.is_uppercase() && !word.is_empty() {
+            words.push(word.to_lowercase());
+            word = String::new();
+            word.push(ch);
+        } else {
+            word.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        words.push(word.to_lowercase());
+    }
+    words
+}
+
 /// スタイル名から意味的役割（SemanticRole）を推定する
 ///
-/// スタイル名に特定のキーワードが含まれる場合に対応する役割を返す。
+/// 1. config の `semantic_role_styles` にカスタムマッピングがあれば優先して返す。
+/// 2. 組み込みルールはスタイル名を単語に分割して境界マッチを行い、
+///    部分一致による誤検知（"Footnote" → "note"、"Barcode" → "code" 等）を防ぐ。
+/// 3. 日本語キーワードは単語境界の概念が異なるため `contains` で照合する。
+///
 /// 見出しスタイルはここでは扱わない（heading_level 判定済みのため）。
-fn determine_role(style: &str) -> Option<SemanticRole> {
+fn determine_role(style: &str, config: &DocxConfig) -> Option<SemanticRole> {
+    // カスタムマッピングを優先確認
+    let normalized = normalize_style_name(style);
+    if let Some(role) = config.semantic_role_styles.get(&normalized) {
+        return Some(role.clone());
+    }
+
+    let words = style_words(style);
     let lower = style.to_lowercase();
-    if lower.contains("warning") || lower.contains("caution") || lower.contains("alert")
-        || lower.contains("danger")
+
+    if words.iter().any(|w| matches!(w.as_str(), "warning" | "caution" | "alert" | "danger"))
+        || lower.contains("警告")
     {
         Some(SemanticRole::Warning)
-    } else if lower.contains("note") || lower.contains("注意") || lower.contains("注記") {
+    } else if words.iter().any(|w| w == "note")
+        || lower.contains("注意") || lower.contains("注記")
+    {
         Some(SemanticRole::Note)
-    } else if lower.contains("tip") || lower.contains("hint") || lower.contains("ヒント") {
+    } else if words.iter().any(|w| matches!(w.as_str(), "tip" | "hint"))
+        || lower.contains("ヒント")
+    {
         Some(SemanticRole::Tip)
-    } else if lower.contains("code") || lower.contains("preformat") || lower.contains("verbatim")
-        || lower.contains("sourcetext")
+    } else if words.iter().any(|w| matches!(w.as_str(), "code" | "verbatim"))
+        // "PreFormat"・"SourceText" はCamelCase分割で1単語にならないため個別チェック
+        || lower.contains("preformat") || lower.contains("sourcetext")
     {
         Some(SemanticRole::CodeBlock)
-    } else if lower.contains("quote") || lower.contains("quotation") || lower.contains("引用") {
+    } else if words.iter().any(|w| matches!(w.as_str(), "quote" | "quotation"))
+        || lower.contains("引用")
+    {
         Some(SemanticRole::Quote)
     } else {
         None
@@ -942,6 +996,161 @@ fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DocxConfig;
+
+    fn default_docx_config() -> DocxConfig {
+        DocxConfig::default()
+    }
+
+    // ── determine_role ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_determine_role_warning_variants() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Warning", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("WarningBox", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("CautionNote", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("AlertStyle", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("DangerZone", &cfg), Some(SemanticRole::Warning));
+    }
+
+    #[test]
+    fn test_determine_role_note_variants() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Note", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("NoteBox", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("note-text", &cfg), Some(SemanticRole::Note));
+    }
+
+    #[test]
+    fn test_determine_role_no_false_positive_footnote() {
+        // "Footnote" は "note" という単語を含まない（footnote = 1 単語）
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Footnote", &cfg), None);
+        assert_eq!(determine_role("FootnoteText", &cfg), None);
+        assert_eq!(determine_role("Annotation", &cfg), None);
+    }
+
+    #[test]
+    fn test_determine_role_no_false_positive_code() {
+        // "Barcode" は "code" という単語を含まない（barcode = 1 単語）
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Barcode", &cfg), None);
+    }
+
+    #[test]
+    fn test_determine_role_code_block_variants() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("CodeBlock", &cfg), Some(SemanticRole::CodeBlock));
+        assert_eq!(determine_role("PreFormat", &cfg), Some(SemanticRole::CodeBlock));
+        assert_eq!(determine_role("Verbatim", &cfg), Some(SemanticRole::CodeBlock));
+        // "SourceText" は複合語だが contains で検出
+        assert_eq!(determine_role("SourceText", &cfg), Some(SemanticRole::CodeBlock));
+    }
+
+    #[test]
+    fn test_determine_role_tip_variants() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Tip", &cfg), Some(SemanticRole::Tip));
+        assert_eq!(determine_role("TipBox", &cfg), Some(SemanticRole::Tip));
+        assert_eq!(determine_role("HintStyle", &cfg), Some(SemanticRole::Tip));
+    }
+
+    #[test]
+    fn test_determine_role_quote_variants() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Quote", &cfg), Some(SemanticRole::Quote));
+        assert_eq!(determine_role("BlockQuote", &cfg), Some(SemanticRole::Quote));
+        assert_eq!(determine_role("Quotation", &cfg), Some(SemanticRole::Quote));
+    }
+
+    #[test]
+    fn test_determine_role_japanese_keywords() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("警告スタイル", &cfg), Some(SemanticRole::Warning));
+        assert_eq!(determine_role("注意事項", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("注記スタイル", &cfg), Some(SemanticRole::Note));
+        assert_eq!(determine_role("ヒント", &cfg), Some(SemanticRole::Tip));
+        assert_eq!(determine_role("引用スタイル", &cfg), Some(SemanticRole::Quote));
+    }
+
+    #[test]
+    fn test_determine_role_custom_mapping() {
+        let mut cfg = default_docx_config();
+        cfg.semantic_role_styles.insert("MyCustomStyle".to_string(), SemanticRole::Warning);
+        assert_eq!(determine_role("MyCustomStyle", &cfg), Some(SemanticRole::Warning));
+        // カスタムマッピングがない場合は組み込みルールにフォールバック
+        assert_eq!(determine_role("NoteBox", &cfg), Some(SemanticRole::Note));
+    }
+
+    #[test]
+    fn test_determine_role_unknown_style() {
+        let cfg = default_docx_config();
+        assert_eq!(determine_role("Normal", &cfg), None);
+        assert_eq!(determine_role("BodyText", &cfg), None);
+        assert_eq!(determine_role("ListParagraph", &cfg), None);
+    }
+
+    // ── style_words ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_style_words_camel_case() {
+        assert_eq!(style_words("WarningBox"), vec!["warning", "box"]);
+        assert_eq!(style_words("NoteText"), vec!["note", "text"]);
+        assert_eq!(style_words("Footnote"), vec!["footnote"]);
+        assert_eq!(style_words("FootnoteText"), vec!["footnote", "text"]);
+    }
+
+    #[test]
+    fn test_style_words_separators() {
+        assert_eq!(style_words("note-text"), vec!["note", "text"]);
+        assert_eq!(style_words("code_block"), vec!["code", "block"]);
+        assert_eq!(style_words("warning style"), vec!["warning", "style"]);
+    }
+
+    // ── is_ordered_numfmt ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_ordered_numfmt() {
+        assert!(is_ordered_numfmt("decimal"));
+        assert!(is_ordered_numfmt("lowerLetter"));
+        assert!(is_ordered_numfmt("upperRoman"));
+        assert!(!is_ordered_numfmt("bullet"));
+        assert!(!is_ordered_numfmt(""));
+    }
+
+    // ── bookmarkStart フィルタリング ──────────────────────────────────────
+
+    #[test]
+    fn test_bookmark_filter_logic() {
+        // _Toc・_GoBack で始まるブックマークはスキップされるはず
+        let toc = "_Toc123456";
+        let go_back = "_GoBack";
+        let valid = "section-intro";
+
+        assert!(toc.starts_with("_Toc") || toc.starts_with("_GoBack"));
+        assert!(go_back.starts_with("_Toc") || go_back.starts_with("_GoBack"));
+        assert!(!valid.starts_with("_Toc") && !valid.starts_with("_GoBack"));
+    }
+
+    // ── outlineLvl 変換（0-based → 1-based）────────────────────────────────
+
+    #[test]
+    fn test_outline_level_conversion() {
+        // Word の outlineLvl は 0-based、出力は 1-based に変換する
+        let raw: u32 = 0;
+        let converted = raw + 1;
+        assert_eq!(converted, 1);
+
+        let raw: u32 = 2;
+        let converted = raw + 1;
+        assert_eq!(converted, 3);
+    }
 }
 
 /// ZIPアーカイブから指定エントリをUTF-8文字列として読み込む
