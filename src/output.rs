@@ -34,7 +34,7 @@ pub fn write_json(doc: &Document, input_path: &Path, output_dir: Option<&Path>, 
 }
 
 /// 出力設定に従いセクションツリーのフィールドを除去する（in-place）
-fn apply_output_config(sections: &mut Vec<Section>, config: &Config) {
+fn apply_output_config(sections: &mut [Section], config: &Config) {
     for sec in sections.iter_mut() {
         if !config.output.include_body_text {
             sec.body_text.clear();
