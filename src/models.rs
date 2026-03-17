@@ -94,6 +94,7 @@ pub struct Section {
     pub heading: String,
     /// 後方互換用フラットテキスト（Markdown 形式）。
     /// 新規コードは elements を参照することを推奨する。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body_text: String,
     /// 構造化要素配列（paragraph / table / asset_ref）。
     /// body_text と並行して生成される。
@@ -122,7 +123,12 @@ pub struct Asset {
     pub id: Option<String>,
     pub title: String,
     /// バイナリデータ。JSON では Base64 文字列として出力される。
-    #[serde(serialize_with = "serialize_as_base64", deserialize_with = "deserialize_from_base64")]
+    #[serde(
+        default,
+        serialize_with = "serialize_as_base64",
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_from_base64"
+    )]
     pub data: Vec<u8>,
 }
 

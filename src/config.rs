@@ -148,9 +148,9 @@ pub struct XlsxHeadingConfig {
 /// JSON 出力設定
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputConfig {
-    /// body_text フィールドを JSON に含めるか（デフォルト: true）。
-    /// false にすると elements から本文を参照する新形式のみ出力される。
-    #[serde(default = "default_true")]
+    /// body_text フィールドを JSON に含めるか（デフォルト: false）。
+    /// true にすると後方互換用フラットテキストも出力される。
+    #[serde(default)]
     pub include_body_text: bool,
 
     /// 画像データを Base64 エンコードして assets.data に含めるか（デフォルト: true）。
@@ -162,7 +162,7 @@ pub struct OutputConfig {
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            include_body_text: true,
+            include_body_text: false,
             include_base64: true,
         }
     }
