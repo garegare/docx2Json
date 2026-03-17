@@ -30,3 +30,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --locked
+
+  deny:
+    name: Dependency Check (audit & licenses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2

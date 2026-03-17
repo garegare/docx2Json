@@ -2,6 +2,7 @@
 name = "docx2json"
 version = "0.2.1"
 edition = "2021"
+license = "MIT"
 
 [[bin]]
 name = "docx2json"

@@ -53,9 +53,30 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
 
+  license-notice:
+    name: Generate NOTICE.html
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked
+
+      - name: Generate NOTICE.html
+        run: cargo about generate about.hbs -o NOTICE.html
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NOTICE
+          path: NOTICE.html
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, license-notice]
     runs-on: ubuntu-latest
     permissions:
       contents: write
