@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::models::{Asset, Document, Section};
+use crate::models::{Asset, Document, Element, Section};
 
 /// 分割後の単一チャンク（RAG インジェスト向け構造）
 #[derive(Debug, Serialize)]
@@ -20,6 +20,8 @@ pub struct Chunk {
     pub heading: String,
     /// このセクション直下の本文（子セクションの内容は含まない）
     pub body_text: String,
+    /// 構造化要素配列（paragraph / table / asset_ref）
+    pub elements: Vec<Element>,
     /// このセクション直下のアセット
     pub assets: Vec<Asset>,
     /// 子セクションのチャンク（再帰的）
@@ -106,6 +108,7 @@ fn section_to_chunk(section: &Section, source: &str) -> Chunk {
         context_path: section.context_path.clone(),
         heading: section.heading.clone(),
         body_text: section.body_text.clone(),
+        elements: section.elements.clone(),
         assets: section.assets.clone(),
         children: section.children.iter()
             .map(|c| section_to_chunk(c, source))

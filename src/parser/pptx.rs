@@ -295,6 +295,7 @@ fn collect_assets(
         let title = zip_path.rsplit('/').next().unwrap_or("image").to_string();
         assets.push(Asset {
             asset_type: "image".to_string(),
+            id: None, // PPTX では rId をアセット参照に使用しないため None
             title,
             data,
         });

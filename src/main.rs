@@ -174,7 +174,7 @@ fn run_parse(args: ParseArgs) {
                     if let Some(level) = args.split {
                         splitter::write_chunks(&doc, path, args.output.as_deref(), level)
                     } else {
-                        output::write_json(&doc, path, args.output.as_deref())
+                        output::write_json(&doc, path, args.output.as_deref(), &cfg)
                     }
                 });
 

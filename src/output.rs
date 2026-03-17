@@ -2,11 +2,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::models::Document;
+use crate::config::Config;
+use crate::models::{Document, Section};
 
 /// DocumentをJSONファイルに書き出す
 /// 出力パスは入力パスの拡張子を .json に置換したもの
-pub fn write_json(doc: &Document, input_path: &Path, output_dir: Option<&Path>) -> Result<()> {
+pub fn write_json(doc: &Document, input_path: &Path, output_dir: Option<&Path>, config: &Config) -> Result<()> {
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -18,10 +19,31 @@ pub fn write_json(doc: &Document, input_path: &Path, output_dir: Option<&Path>) 
         input_path.with_extension("json")
     };
 
-    let json = serde_json::to_string_pretty(doc)
-        .context("JSONシリアライズに失敗")?;
+    let json = if !config.output.include_body_text || !config.output.include_base64 {
+        // オプション無効時はドキュメントを複製してフィールドを除去してからシリアライズ
+        let mut doc = doc.clone();
+        apply_output_config(&mut doc.sections, config);
+        serde_json::to_string_pretty(&doc).context("JSONシリアライズに失敗")?
+    } else {
+        serde_json::to_string_pretty(doc).context("JSONシリアライズに失敗")?
+    };
+
     std::fs::write(&out_path, &json)
         .with_context(|| format!("ファイルへの書き込みに失敗: {}", out_path.display()))?;
-    // 出力先の表示は main.rs の結果サマリーで一括表示するため ここでは省略
     Ok(())
+}
+
+/// 出力設定に従いセクションツリーのフィールドを除去する（in-place）
+fn apply_output_config(sections: &mut [Section], config: &Config) {
+    for sec in sections.iter_mut() {
+        if !config.output.include_body_text {
+            sec.body_text.clear();
+        }
+        if !config.output.include_base64 {
+            for asset in &mut sec.assets {
+                asset.data.clear();
+            }
+        }
+        apply_output_config(&mut sec.children, config);
+    }
 }
