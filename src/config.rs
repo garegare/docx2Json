@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::models::SemanticRole;
+
 // ── デフォルト値ヘルパー ────────────────────────────────────────────────
 
 fn default_true() -> bool {
@@ -65,6 +67,16 @@ pub struct DocxConfig {
     /// 直接書式設定で見出しを表現する文書向け。誤検出防止のためデフォルトはオフ。
     #[serde(default)]
     pub run_underline_as_heading: bool,
+
+    /// カスタム意味的役割マッピング: スタイル名（正規化済み） → SemanticRole
+    ///
+    /// 組み込みルール（単語境界マッチ）より優先される。
+    /// 値は SemanticRole の snake_case 文字列: "note" / "warning" / "tip" /
+    /// "code_block" / "quote" / "bullet_list" / "ordered_list"
+    ///
+    /// 例: `{ "MyCustomNote": "note", "SpecialAlert": "warning" }`
+    #[serde(default)]
+    pub semantic_role_styles: HashMap<String, SemanticRole>,
 }
 
 impl Default for DocxConfig {
@@ -84,6 +96,7 @@ impl Default for DocxConfig {
             heading_styles,
             ppr_underline_as_heading: true,
             run_underline_as_heading: false,
+            semantic_role_styles: HashMap::new(),
         }
     }
 }
@@ -132,6 +145,29 @@ pub struct XlsxHeadingConfig {
     pub heading_cell_ratio: f32,
 }
 
+/// JSON 出力設定
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputConfig {
+    /// body_text フィールドを JSON に含めるか（デフォルト: true）。
+    /// false にすると elements から本文を参照する新形式のみ出力される。
+    #[serde(default = "default_true")]
+    pub include_body_text: bool,
+
+    /// 画像データを Base64 エンコードして assets.data に含めるか（デフォルト: true）。
+    /// false にするとデータフィールドを省略し JSON サイズを削減できる。
+    #[serde(default = "default_true")]
+    pub include_base64: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            include_body_text: true,
+            include_base64: true,
+        }
+    }
+}
+
 // ── メイン Config 構造体 ────────────────────────────────────────────────
 
 /// 変換設定（docx2json.json から読み込む）
@@ -154,6 +190,10 @@ pub struct Config {
     /// XLSX パーサー設定
     #[serde(default)]
     pub xlsx: XlsxConfig,
+
+    /// JSON 出力設定
+    #[serde(default)]
+    pub output: OutputConfig,
 
     /// ロード時にコンパイル済みのマッチングルール群（serde には含まない）
     #[serde(skip)]
@@ -181,6 +221,7 @@ impl Default for Config {
             image: ImageConfig::default(),
             docx,
             xlsx: XlsxConfig::default(),
+            output: OutputConfig::default(),
             heading_rules: rules,
         }
     }
@@ -216,6 +257,11 @@ impl Config {
                             cfg.docx.heading_styles = cfg.docx.heading_styles
                                 .into_iter()
                                 .map(|(k, v)| (normalize_style_key(&k), v))
+                                .collect();
+                            // semantic_role_styles のキーを正規化
+                            cfg.docx.semantic_role_styles = cfg.docx.semantic_role_styles
+                                .into_iter()
+                                .map(|(k, v)| (normalize_style_name(&k), v))
                                 .collect();
                             // マッチングルールをコンパイル
                             cfg.heading_rules = compile_heading_rules(&cfg.docx.heading_styles);
