@@ -275,7 +275,8 @@ fn parse_document_xml(
     // w:fldChar / w:instrText で表現されるフィールドコード（PAGE, DATE, REF 等）の
     // 命令テキスト（w:instrText）を出力から除外するためのフラグ。
     // フィールドの表示値（begin→separate 間を除く w:t）は通常通り出力する。
-    let mut in_fld_instr = false; // w:instrText 内か
+    let mut in_fld_instr = false;    // w:instrText 内か
+    let mut in_ppr_change = false;   // w:pPrChange 内か（変更前の古いプロパティをスキップ）
 
     // ---- OMML（数式）パーサー状態 ----
     // Office Math Markup Language (OMML) を LaTeX ライクな表記に変換する。
@@ -434,23 +435,35 @@ fn parse_document_xml(
                 para_anchor_id = None;
             }
 
+            // ---- 段落プロパティ変更追跡（w:pPrChange）----
+            // w:pPrChange には変更前の古いプロパティが入った w:pPr が含まれる。
+            // その内部の w:pStyle 等を読み取ると現在のスタイルが上書きされるため、
+            // pPrChange 内では全プロパティ読み取りをスキップする。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"pPrChange" => {
+                in_ppr_change = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPrChange" => {
+                in_ppr_change = false;
+            }
+
             // ---- 段落プロパティ ----
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"pPr" => {
                 in_ppr = true;
             }
-            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPr" => {
+            // pPrChange 内のネストした </w:pPr> では in_ppr をリセットしない
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPr" && !in_ppr_change => {
                 in_ppr = false;
                 in_ppr_rpr = false;
                 in_numpr = false;
             }
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"pStyle" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"pStyle" => {
                 if let Some(val) = attr_value(&e, "w:val").or_else(|| attr_value(&e, "val")) {
                     paragraph_style = Some(val);
                 }
             }
 
             // ---- 段落の水平配置（w:jc）----
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"jc" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"jc" => {
                 if let Some(val) = attr_value(&e, "val") {
                     para_alignment = Some(val);
                 }
@@ -458,7 +471,7 @@ fn parse_document_xml(
 
             // ---- アウトラインレベル（w:outlineLvl）----
             // Word では 0-based（0 = 見出し1相当）なので +1 して 1-based に変換する
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"outlineLvl" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"outlineLvl" => {
                 if let Some(val) = attr_value(&e, "val") {
                     para_outline_level = val.parse::<u32>().ok().map(|v| v + 1);
                 }
@@ -480,7 +493,7 @@ fn parse_document_xml(
 
             // ---- 箇条書き番号参照（w:numPr）----
             // <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
-            Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"numPr" => {
+            Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"numPr" => {
                 in_numpr = true;
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"numPr" => {
@@ -504,7 +517,7 @@ fn parse_document_xml(
             // ---- ランプロパティ ----
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"rPr" => {
                 in_rpr = true;
-                if in_ppr { in_ppr_rpr = true; }
+                if in_ppr && !in_ppr_change { in_ppr_rpr = true; }
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"rPr" => {
                 in_rpr = false;
