@@ -84,11 +84,16 @@ impl Default for DocxConfig {
         let mut heading_styles = HashMap::new();
         for (name, level) in [
             ("Heading1", 1usize), ("Heading2", 2), ("Heading3", 3),
+            ("Heading4", 4), ("Heading5", 5), ("Heading6", 6),
             ("heading1", 1), ("heading2", 2), ("heading3", 3),
+            ("heading4", 4), ("heading5", 5), ("heading6", 6),
             ("見出し1", 1), ("見出し2", 2), ("見出し3", 3),
+            ("見出し4", 4), ("見出し5", 5), ("見出し6", 6),
             // 全角数字バリアント（正規化で「見出し1」に統合済み）
             ("見出し１", 1), ("見出し２", 2), ("見出し３", 3),
+            ("見出し４", 4), ("見出し５", 5), ("見出し６", 6),
             ("1", 1), ("2", 2), ("3", 3), // 数値IDスタイル
+            ("4", 4), ("5", 5), ("6", 6),
         ] {
             heading_styles.insert(normalize_style_name(name), level);
         }

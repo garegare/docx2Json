@@ -271,6 +271,19 @@ fn parse_document_xml(
     let mut current_row: Vec<String> = Vec::new();  // 現在の行のセル
     let mut table_rows: Vec<Vec<String>> = Vec::new(); // テーブル全行
 
+    // ---- フィールドコード状態 ----
+    // w:fldChar / w:instrText で表現されるフィールドコード（PAGE, DATE, REF 等）の
+    // 命令テキスト（w:instrText）を出力から除外するためのフラグ。
+    // フィールドの表示値（separate→end 間の w:t）は通常通り出力する。
+    // in_fld_char_instr は OOXML 仕様上 w:t が begin→separate 間に現れる
+    // エッジケース（互換モード文書等）に対応するための二重ガード。
+    let mut in_fld_instr = false;         // w:instrText 内か
+    let mut in_fld_char_instr = false;    // w:fldChar begin→separate 間か（エッジケース用）
+
+    // ---- 変更追跡プロパティ ----
+    let mut in_ppr_change = false;   // w:pPrChange 内か（変更前の古い段落プロパティをスキップ）
+    let mut in_rpr_change = false;   // w:rPrChange 内か（変更前の古いランプロパティをスキップ）
+
     // ---- OMML（数式）パーサー状態 ----
     // Office Math Markup Language (OMML) を LaTeX ライクな表記に変換する。
     // SAX スタイルパーサーで再帰構造を扱うため、(要素名, 出力バッファ) の
@@ -428,23 +441,35 @@ fn parse_document_xml(
                 para_anchor_id = None;
             }
 
+            // ---- 段落プロパティ変更追跡（w:pPrChange）----
+            // w:pPrChange には変更前の古いプロパティが入った w:pPr が含まれる。
+            // その内部の w:pStyle 等を読み取ると現在のスタイルが上書きされるため、
+            // pPrChange 内では全プロパティ読み取りをスキップする。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"pPrChange" => {
+                in_ppr_change = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPrChange" => {
+                in_ppr_change = false;
+            }
+
             // ---- 段落プロパティ ----
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"pPr" => {
                 in_ppr = true;
             }
-            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPr" => {
+            // pPrChange 内のネストした </w:pPr> では in_ppr をリセットしない
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"pPr" && !in_ppr_change => {
                 in_ppr = false;
                 in_ppr_rpr = false;
                 in_numpr = false;
             }
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"pStyle" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"pStyle" => {
                 if let Some(val) = attr_value(&e, "w:val").or_else(|| attr_value(&e, "val")) {
                     paragraph_style = Some(val);
                 }
             }
 
             // ---- 段落の水平配置（w:jc）----
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"jc" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"jc" => {
                 if let Some(val) = attr_value(&e, "val") {
                     para_alignment = Some(val);
                 }
@@ -452,7 +477,7 @@ fn parse_document_xml(
 
             // ---- アウトラインレベル（w:outlineLvl）----
             // Word では 0-based（0 = 見出し1相当）なので +1 して 1-based に変換する
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"outlineLvl" => {
+            Ok(Event::Empty(e)) | Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"outlineLvl" => {
                 if let Some(val) = attr_value(&e, "val") {
                     para_outline_level = val.parse::<u32>().ok().map(|v| v + 1);
                 }
@@ -474,7 +499,7 @@ fn parse_document_xml(
 
             // ---- 箇条書き番号参照（w:numPr）----
             // <w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>
-            Ok(Event::Start(e)) if in_ppr && e.local_name().as_ref() == b"numPr" => {
+            Ok(Event::Start(e)) if in_ppr && !in_ppr_change && e.local_name().as_ref() == b"numPr" => {
                 in_numpr = true;
             }
             Ok(Event::End(e)) if e.local_name().as_ref() == b"numPr" => {
@@ -495,12 +520,26 @@ fn parse_document_xml(
                 para_num_id = attr_value(&e, "val").filter(|s| s != "0");
             }
 
+            // ---- ラン単位プロパティ変更追跡（w:rPrChange）----
+            // w:rPrChange には変更前の古いランプロパティが入った w:rPr が含まれる。
+            // w:pPrChange と同様に、内部の w:u 等を読み取ると現在のプロパティが
+            // 上書きされるため、rPrChange 内では全プロパティ読み取りをスキップする。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"rPrChange" => {
+                in_rpr_change = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"rPrChange" => {
+                in_rpr_change = false;
+            }
+
             // ---- ランプロパティ ----
             Ok(Event::Start(e)) if e.local_name().as_ref() == b"rPr" => {
-                in_rpr = true;
-                if in_ppr { in_ppr_rpr = true; }
+                if !in_rpr_change {
+                    in_rpr = true;
+                    if in_ppr && !in_ppr_change { in_ppr_rpr = true; }
+                }
             }
-            Ok(Event::End(e)) if e.local_name().as_ref() == b"rPr" => {
+            // rPrChange 内のネストした </w:rPr> では in_rpr をリセットしない
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"rPr" && !in_rpr_change => {
                 in_rpr = false;
                 in_ppr_rpr = false;
             }
@@ -513,7 +552,7 @@ fn parse_document_xml(
                 if val.as_deref() != Some("none") {
                     if in_ppr_rpr {
                         ppr_underline = true;
-                    } else if in_rpr && !in_ppr {
+                    } else if in_rpr && !in_ppr && !in_rpr_change {
                         run_underline = true;
                     }
                 }
@@ -601,6 +640,34 @@ fn parse_document_xml(
                 }
             }
 
+            // ---- フィールドコード（w:fldChar begin/separate/end）----
+            // OOXML 複合フィールドの構造:
+            //   fldChar(begin) → [instrText or w:t] → fldChar(separate) → w:t（表示値）→ fldChar(end)
+            // 標準実装では命令部は w:instrText に入るが、互換モード文書では w:t に
+            // 入ることがある（エッジケース）。in_fld_char_instr で両方をカバーする。
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if e.local_name().as_ref() == b"fldChar" =>
+            {
+                match attr_value(&e, "w:fldCharType")
+                    .or_else(|| attr_value(&e, "fldCharType"))
+                    .as_deref()
+                {
+                    Some("begin")    => in_fld_char_instr = true,
+                    Some("separate") => in_fld_char_instr = false,
+                    Some("end")      => in_fld_char_instr = false,
+                    _ => {}
+                }
+            }
+
+            // ---- フィールドコード命令テキスト（w:instrText）----
+            // 命令テキストを除外する（通常はここに命令が入る）。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"instrText" => {
+                in_fld_instr = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"instrText" => {
+                in_fld_instr = false;
+            }
+
             // ---- ソフト改行（w:br）----
             // <w:br/> または <w:br w:type="textWrapping"/> はラン内の強制改行。
             // ページ区切り（w:type="page"）や段区切り（"column"）はテキストに含めない。
@@ -617,7 +684,7 @@ fn parse_document_xml(
             }
 
             // ---- テキストノード ----
-            Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr => {
+            Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr && !in_fld_instr && !in_fld_char_instr => {
                 let text = e.unescape().unwrap_or_default();
                 if in_omath > 0 && in_mt {
                     // 数式テキスト: omath_stack のトップバッファに追記
@@ -667,6 +734,27 @@ fn parse_document_xml(
                         // level=0（"Title" スタイルなど）はセクションとして扱わずスキップ。
                         // config で level=0 を設定した場合のパニック防止でもある。
                         if level == 0 {
+                            continue;
+                        }
+                        // 見出しテキストが空で図のみの場合（例: 図を含む見出し段落でテキスト無し）は
+                        // 新しいセクションを作成せず、現在のセクションに図として追加する。
+                        if body.is_empty() && !assets.is_empty() {
+                            if let Some((_, sec)) = stack.last_mut() {
+                                for asset in &assets {
+                                    sec.elements.push(Element::AssetRef {
+                                        asset_id: asset.id.clone().unwrap_or_default(),
+                                        metadata: ElementMetadata {
+                                            caption: if asset.title.is_empty() {
+                                                None
+                                            } else {
+                                                Some(asset.title.clone())
+                                            },
+                                            ..Default::default()
+                                        },
+                                    });
+                                }
+                                sec.assets.extend(assets);
+                            }
                             continue;
                         }
                         let new_section = Section {
@@ -1322,6 +1410,263 @@ mod tests {
         let raw: u32 = 10;
         let converted = raw.saturating_add(1);
         assert_eq!(converted, 11); // オーバーフローなし
+    }
+
+    // ── parse_document_xml: 変更追跡 (Track Changes) ──────────────────────
+
+    fn empty_images() -> HashMap<String, Vec<u8>> { HashMap::new() }
+    fn empty_numbering() -> HashMap<String, Vec<String>> { HashMap::new() }
+    fn default_config() -> Config { Config::default() }
+
+    /// テスト用: 全セクション（再帰）から heading テキストを収集する
+    fn collect_headings(sections: &[Section]) -> Vec<String> {
+        let mut out = Vec::new();
+        for s in sections {
+            if !s.heading.is_empty() {
+                out.push(s.heading.clone());
+            }
+            out.extend(collect_headings(&s.children));
+        }
+        out
+    }
+
+    /// テスト用: 全セクション（再帰）から body テキストを連結する
+    fn collect_body_texts(sections: &[Section]) -> String {
+        let mut out = String::new();
+        for s in sections {
+            out.push_str(&s.body_text);
+            out.push_str(&collect_body_texts(&s.children));
+        }
+        out
+    }
+
+    /// テスト用: 全セクション（再帰）から Element::Paragraph テキストを連結する
+    fn collect_element_texts(sections: &[Section]) -> String {
+        let mut out = String::new();
+        for s in sections {
+            for e in &s.elements {
+                if let Element::Paragraph { text, .. } = e {
+                    out.push_str(text);
+                }
+            }
+            out.push_str(&collect_element_texts(&s.children));
+        }
+        out
+    }
+
+    /// 変更追跡なしの見出し3は Section として出力される（ベースライン）
+    #[test]
+    fn test_heading3_no_track_changes() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+      <w:r><w:t>見出しテキスト</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let headings = collect_headings(&sections);
+        assert_eq!(headings, vec!["見出しテキスト"]);
+    }
+
+    /// pPrChange: Normal→Heading3 の変更追跡がある段落は現在スタイル（Heading3）で判定される
+    #[test]
+    fn test_ppr_change_normal_to_heading3_is_section() {
+        // w:pPrChange 内の w:pStyle w:val="Normal" が現在の Heading3 を上書きしないこと
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="Heading3"/>
+        <w:pPrChange w:id="1" w:author="Test" w:date="2024-01-01T00:00:00Z">
+          <w:pPr><w:pStyle w:val="Normal"/></w:pPr>
+        </w:pPrChange>
+      </w:pPr>
+      <w:r><w:t>変更追跡見出し</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let headings = collect_headings(&sections);
+        assert_eq!(headings, vec!["変更追跡見出し"], "pPrChange で見出しがパラグラフになってはならない");
+    }
+
+    /// pPrChange: Heading3→Normal の変更追跡がある段落は現在スタイル（Normal）= パラグラフ
+    #[test]
+    fn test_ppr_change_heading3_to_normal_is_paragraph() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>親見出し</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="Normal"/>
+        <w:pPrChange w:id="2" w:author="Test" w:date="2024-01-01T00:00:00Z">
+          <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+        </w:pPrChange>
+      </w:pPr>
+      <w:r><w:t>本文テキスト</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        // "本文テキスト" は heading にならず、本文（body_text）に入ること
+        let headings = collect_headings(&sections);
+        assert!(!headings.contains(&"本文テキスト".to_string()),
+            "Heading3→Normal の変更追跡はパラグラフとして扱われる");
+        let body = collect_body_texts(&sections);
+        assert!(body.contains("本文テキスト"), "本文テキストが body_text に含まれること");
+    }
+
+    /// 同一文書内で変更追跡あり/なしの見出し3が混在しても両方 Section として出力される
+    #[test]
+    fn test_mixed_track_changes_consistency() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading3"/></w:pPr>
+      <w:r><w:t>変更追跡なし見出し</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="Heading3"/>
+        <w:pPrChange w:id="3" w:author="Test" w:date="2024-01-01T00:00:00Z">
+          <w:pPr><w:pStyle w:val="Normal"/></w:pPr>
+        </w:pPrChange>
+      </w:pPr>
+      <w:r><w:t>変更追跡あり見出し</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let headings = collect_headings(&sections);
+        assert_eq!(headings.len(), 2, "変更追跡あり/なし両方の見出し3が Section になること");
+        assert!(headings.contains(&"変更追跡なし見出し".to_string()));
+        assert!(headings.contains(&"変更追跡あり見出し".to_string()));
+    }
+
+    /// pPrChange 内に outlineLvl / numPr が含まれても現在の段落判定に影響しない
+    #[test]
+    fn test_ppr_change_outline_lvl_not_overwritten() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="Heading2"/>
+        <w:pPrChange w:id="4" w:author="Test" w:date="2024-01-01T00:00:00Z">
+          <w:pPr>
+            <w:pStyle w:val="Normal"/>
+            <w:outlineLvl w:val="8"/>
+          </w:pPr>
+        </w:pPrChange>
+      </w:pPr>
+      <w:r><w:t>見出し2テキスト</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let headings = collect_headings(&sections);
+        assert_eq!(headings, vec!["見出し2テキスト"],
+            "pPrChange 内の outlineLvl で見出しレベルや判定が変わってはならない");
+    }
+
+    /// rPrChange: 変更前の下線プロパティが現在の下線状態を上書きしない
+    #[test]
+    fn test_rpr_change_old_underline_not_detected_as_heading() {
+        // 変更前は下線あり（旧 rPr）、変更後は下線なし（現在）
+        // → run_underline_as_heading が有効でも見出しにならない
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>親見出し</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Normal"/></w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rPrChange w:id="5" w:author="Test" w:date="2024-01-01T00:00:00Z">
+            <w:rPr><w:u w:val="single"/></w:rPr>
+          </w:rPrChange>
+        </w:rPr>
+        <w:t>下線なし本文</w:t>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let mut cfg = default_config();
+        cfg.docx.run_underline_as_heading = true;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &cfg).unwrap();
+        let headings = collect_headings(&sections);
+        // 旧プロパティの下線で見出し Section が増えてはならない
+        assert_eq!(headings, vec!["親見出し"],
+            "rPrChange 内の古い下線で見出し判定されてはならない");
+        let body = collect_body_texts(&sections);
+        assert!(body.contains("下線なし本文"), "本文テキストは body_text に含まれること");
+    }
+
+    // ── parse_document_xml: フィールドコード（w:fldChar / w:instrText）────
+
+    /// instrText の中身はテキスト出力に含まれない
+    #[test]
+    fn test_instr_text_excluded() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>セクション</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Normal"/></w:pPr>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:instrText> PAGE </w:instrText></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>42</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let elem_text = collect_element_texts(&sections);
+        assert!(!elem_text.contains("PAGE"), "instrText の命令文字列は出力に含まれてはならない");
+        assert!(elem_text.contains("42"), "フィールドの表示値（42）は出力に含まれること");
+    }
+
+    /// fldChar begin→separate 間に w:t が存在する互換モードのエッジケース
+    #[test]
+    fn test_fld_char_instr_text_in_wt_excluded() {
+        // 互換モード文書では w:instrText でなく w:t にフィールド命令が入ることがある
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>セクション</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Normal"/></w:pPr>
+      <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+      <w:r><w:t> DATE \@ "yyyy/MM/dd" </w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+      <w:r><w:t>2024/01/01</w:t></w:r>
+      <w:r><w:fldChar w:fldCharType="end"/></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let elem_text = collect_element_texts(&sections);
+        assert!(!elem_text.contains("DATE"), "fldChar begin→separate 間の w:t は除外されること");
+        assert!(elem_text.contains("2024/01/01"), "フィールド表示値は出力に含まれること");
     }
 }
 
