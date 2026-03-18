@@ -271,6 +271,12 @@ fn parse_document_xml(
     let mut current_row: Vec<String> = Vec::new();  // 現在の行のセル
     let mut table_rows: Vec<Vec<String>> = Vec::new(); // テーブル全行
 
+    // ---- フィールドコード状態 ----
+    // w:fldChar / w:instrText で表現されるフィールドコード（PAGE, DATE, REF 等）の
+    // 命令テキスト（w:instrText）を出力から除外するためのフラグ。
+    // フィールドの表示値（begin→separate 間を除く w:t）は通常通り出力する。
+    let mut in_fld_instr = false; // w:instrText 内か
+
     // ---- OMML（数式）パーサー状態 ----
     // Office Math Markup Language (OMML) を LaTeX ライクな表記に変換する。
     // SAX スタイルパーサーで再帰構造を扱うため、(要素名, 出力バッファ) の
@@ -601,6 +607,16 @@ fn parse_document_xml(
                 }
             }
 
+            // ---- フィールドコード命令テキスト（w:instrText）----
+            // フィールドコードの命令部分（例: " PAGE "、" DATE \@ ..."）を除外する。
+            // begin/separate/end の fldChar で囲まれた表示値（w:t）は通常通り出力される。
+            Ok(Event::Start(e)) if e.local_name().as_ref() == b"instrText" => {
+                in_fld_instr = true;
+            }
+            Ok(Event::End(e)) if e.local_name().as_ref() == b"instrText" => {
+                in_fld_instr = false;
+            }
+
             // ---- ソフト改行（w:br）----
             // <w:br/> または <w:br w:type="textWrapping"/> はラン内の強制改行。
             // ページ区切り（w:type="page"）や段区切り（"column"）はテキストに含めない。
@@ -617,7 +633,7 @@ fn parse_document_xml(
             }
 
             // ---- テキストノード ----
-            Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr => {
+            Ok(Event::Text(e)) if in_del == 0 && !in_ppr && !in_rpr && !in_fld_instr => {
                 let text = e.unescape().unwrap_or_default();
                 if in_omath > 0 && in_mt {
                     // 数式テキスト: omath_stack のトップバッファに追記
@@ -667,6 +683,27 @@ fn parse_document_xml(
                         // level=0（"Title" スタイルなど）はセクションとして扱わずスキップ。
                         // config で level=0 を設定した場合のパニック防止でもある。
                         if level == 0 {
+                            continue;
+                        }
+                        // 見出しテキストが空で図のみの場合（例: 図を含む見出し段落でテキスト無し）は
+                        // 新しいセクションを作成せず、現在のセクションに図として追加する。
+                        if body.is_empty() && !assets.is_empty() {
+                            if let Some((_, sec)) = stack.last_mut() {
+                                for asset in &assets {
+                                    sec.elements.push(Element::AssetRef {
+                                        asset_id: asset.id.clone().unwrap_or_default(),
+                                        metadata: ElementMetadata {
+                                            caption: if asset.title.is_empty() {
+                                                None
+                                            } else {
+                                                Some(asset.title.clone())
+                                            },
+                                            ..Default::default()
+                                        },
+                                    });
+                                }
+                                sec.assets.extend(assets);
+                            }
                             continue;
                         }
                         let new_section = Section {

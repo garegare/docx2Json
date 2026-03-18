@@ -17,8 +17,9 @@ pub fn parse_file(path: &Path, config: &Config) -> Result<Document> {
             .with_context(|| format!("DOCXパース失敗: {}", path.display()))?,
         Some("pptx") => pptx::parse(path, config)
             .with_context(|| format!("PPTXパース失敗: {}", path.display()))?,
-        Some("xlsx") => {
+        Some("xlsx") | Some("xlsm") => {
             // xlsx_heading.enabled == true のとき神エクセル対応パーサーに切り替え
+            // xlsm（マクロ有効ブック）は xlsx と同じ構造のため同一パーサーで処理する
             if config.xlsx.heading.as_ref().is_some_and(|h| h.enabled) {
                 xlsx_advanced::parse(path, config)
                     .with_context(|| format!("XLSX(advanced)パース失敗: {}", path.display()))?
