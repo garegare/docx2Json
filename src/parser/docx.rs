@@ -404,13 +404,16 @@ fn parse_document_xml(
             // 行終了: hMerge 解決 → gridBefore/gridAfter 適用 → テーブルに追加
             Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tr" => {
                 // hMerge 継続セルに左隣のセル内容をコピー（横結合・旧方式の解決）
-                // 左から順に走査することで連鎖した継続セルも正しく伝播する
-                for j in 1..current_row.len() {
-                    if current_row_hmerge[j] {
+                // 左から順に走査することで連鎖した継続セルも正しく伝播する。
+                // hMerge は行内の隣接セル間の操作で完結するため、後続の
+                // gridBefore/gridAfter パディングに影響されない。
+                // enumerate で current_row_hmerge の長さ分だけ走査することで、
+                // 壊れた .docx 等で両 Vec の長さが異なる場合もパニックしない。
+                for (j, &is_continue) in current_row_hmerge.iter().enumerate().skip(1) {
+                    if is_continue && j < current_row.len() {
                         current_row[j] = current_row[j - 1].clone();
                     }
                 }
-                current_row_hmerge.clear();
 
                 // gridBefore/gridAfter: 行頭・行末に空グリッド列を挿入
                 // インデント行や不揃いな行を持つ表で縦結合の列インデックスを合わせるために必要
