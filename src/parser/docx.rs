@@ -998,17 +998,7 @@ fn determine_role(style: &str, config: &DocxConfig) -> Option<SemanticRole> {
     }
 }
 
-/// XML要素から属性値を取得する（名前空間プレフィックスを無視）
-fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    let local = name.split(':').next_back().unwrap_or(name);
-    for attr in e.attributes().flatten() {
-        let key = attr.key.local_name();
-        if key.as_ref() == local.as_bytes() {
-            return String::from_utf8(attr.value.to_vec()).ok();
-        }
-    }
-    None
-}
+use super::attr_value;
 
 #[cfg(test)]
 mod tests {

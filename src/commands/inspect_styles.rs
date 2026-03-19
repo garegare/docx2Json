@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::BufReader;
 use std::path::PathBuf;
 
@@ -7,6 +7,8 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 use serde::Serialize;
 use zip::ZipArchive;
+
+use crate::parser::attr_value;
 
 /// `inspect-styles` サブコマンドの引数
 #[derive(clap::Args)]
@@ -38,7 +40,7 @@ struct InspectOutput {
 
 #[derive(Serialize)]
 struct DocxSnippet {
-    heading_styles: HashMap<String, usize>,
+    heading_styles: BTreeMap<String, usize>,
 }
 
 #[derive(Serialize)]
@@ -50,8 +52,8 @@ struct StyleDetail {
 
 pub fn run(args: Args) -> Result<()> {
     let path = &args.input;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !matches!(ext, "docx") {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    if ext != "docx" {
         anyhow::bail!("DOCX ファイルを指定してください（拡張子が .docx であること）: {}", path.display());
     }
 
@@ -66,7 +68,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     // heading_styles マップ: styleId と name の両方をキーとして登録（重複時は1エントリ）
-    let mut heading_styles: HashMap<String, usize> = HashMap::new();
+    let mut heading_styles: BTreeMap<String, usize> = BTreeMap::new();
     let mut style_details: Vec<StyleDetail> = Vec::new();
 
     eprintln!("見出しスタイルを {} 件検出: {}", styles.len(), path.display());
@@ -146,6 +148,9 @@ fn parse_styles_xml(docx_path: &PathBuf) -> Result<Vec<StyleEntry>> {
                             current_name = Some(val);
                         }
                     }
+                    // TODO: basedOn によるスタイル継承（親が outlineLvl を持ち子が上書きしない場合）は
+                    //       現在未対応。日本語テンプレートでカスタムスタイルが見出しを継承している
+                    //       場合に検出されないことがある。
                     b"outlineLvl" if in_style => {
                         if let Some(val) = attr_value(e, "val") {
                             if let Ok(n) = val.parse::<usize>() {
@@ -188,13 +193,3 @@ fn parse_styles_xml(docx_path: &PathBuf) -> Result<Vec<StyleEntry>> {
     Ok(styles)
 }
 
-/// XML 要素から属性値を取得する（名前空間プレフィックスを無視）
-fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    let local = name.split(':').next_back().unwrap_or(name);
-    for attr in e.attributes().flatten() {
-        if attr.key.local_name().as_ref() == local.as_bytes() {
-            return String::from_utf8(attr.value.to_vec()).ok();
-        }
-    }
-    None
-}

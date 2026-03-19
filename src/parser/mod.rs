@@ -66,6 +66,19 @@ fn fill_section_id(sections: &mut Vec<Section>, title: &str) {
     }
 }
 
+/// XML 要素から属性値を取得する（名前空間プレフィックスを無視してローカル名で検索）。
+///
+/// `name` に ":" が含まれる場合は最後の部分をローカル名として使用する。
+pub(crate) fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+    let local = name.split(':').next_back().unwrap_or(name);
+    for attr in e.attributes().flatten() {
+        if attr.key.local_name().as_ref() == local.as_bytes() {
+            return String::from_utf8(attr.value.to_vec()).ok();
+        }
+    }
+    None
+}
+
 /// 文字列の FNV-1a 64bit ハッシュを 16文字の 16進数文字列として返す。
 fn fnv1a_hex(s: &str) -> String {
     const FNV_OFFSET: u64 = 14695981039346656037;
