@@ -999,7 +999,7 @@ fn omath_pop_and_combine(stack: &mut Vec<(String, String)>, child_tag: &str) {
 /// 行 i の継続セルは `rows[i-1][j]` からコピーするが、`rows[i-1]` 自体も
 /// 継続セルである場合（3行以上の縦結合）、その行がすでに解決済みであることに
 /// 依存している。逆順に走査すると未解決の空文字列が伝播するバグになる。
-fn resolve_vmerge(rows: &mut Vec<Vec<String>>, vmerge: &[Vec<bool>]) {
+fn resolve_vmerge(rows: &mut [Vec<String>], vmerge: &[Vec<bool>]) {
     for i in 1..rows.len() {
         let cols = rows[i].len();
         for j in 0..cols {
