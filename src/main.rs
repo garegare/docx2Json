@@ -31,6 +31,8 @@ enum Commands {
     ExtractCandidates(commands::extract_candidates::Args),
     /// セクションに AI タグを注入してバリデーションする
     InjectTags(commands::inject_tags::Args),
+    /// DOCX ファイルの見出しスタイルを走査して docx2json.json 用設定スニペットを出力する
+    InspectStyles(commands::inspect_styles::Args),
     /// 複数の document.json からタグ使用統計を集計する
     Summarize(commands::summarize::Args),
 }
@@ -94,6 +96,12 @@ fn main() {
         }
         Some(Commands::InjectTags(args)) => {
             if let Err(e) = commands::inject_tags::run(args) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::InspectStyles(args)) => {
+            if let Err(e) = commands::inspect_styles::run(args) {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }

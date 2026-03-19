@@ -37,6 +37,7 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **意味的役割（SemanticRole）** | ✅ | スタイル名から `Warning` / `Note` / `Tip` / `CodeBlock` / `Quote` 等を自動推定し `elements[].metadata.role` に付与。日本語スタイル名にも対応。 |
 | **カスタム SemanticRole マッピング** | ✅ | `docx.semantic_role_styles` でスタイル名 → SemanticRole を設定ファイルから外部注入可能。 |
 | **出力フィールド制御** | ✅ | `output.include_body_text`（デフォルト: `false`）と `output.include_base64`（デフォルト: `true`）で JSON サイズを最適化。 |
+| **見出しスタイル検査** | ✅ | `inspect-styles` サブコマンド。DOCX の `word/styles.xml` を走査し、見出しスタイル一覧と `docx2json.json` 用 `heading_styles` 設定スニペットを JSON で出力。 |
 
 ## 🛠 技術スタック
 | カテゴリ | ライブラリ | 選定理由 |
@@ -122,6 +123,52 @@ cargo run -- parse --dump-config > docx2json.json
 | `--image-quality <Q>` | — | `80` | `image.quality` | JPEG 品質（1〜100）。設定ファイルより優先 |
 | `--xlsx-max-rows <N>` | — | `0`（無効） | `xlsx.max_rows` | XLSX シートの最大行数。設定ファイルより優先 |
 | `--dump-config` | — | — | — | 実効設定（設定ファイル + CLI 引数の適用後）を JSON で出力して終了 |
+
+### `inspect-styles` — DOCX 見出しスタイル検査
+
+カスタムスタイルを使っている DOCX をパースする前に、どのスタイル名が見出しとして定義されているかを確認できます。
+出力された `docx.heading_styles` は `docx2json.json` にそのまま貼り付けて使用できます。
+
+```bash
+# 標準出力に JSON を表示（stderr に検出サマリー）
+docx2json inspect-styles --input ./sample.docx
+
+# ファイルに書き出す
+docx2json inspect-styles --input ./sample.docx --output ./heading_config.json
+```
+
+**出力例（stdout）:**
+```json
+{
+  "docx": {
+    "heading_styles": {
+      "1": 1,
+      "heading 1": 1,
+      "2": 2,
+      "heading 2": 2,
+      "3": 3,
+      "heading 3": 3
+    }
+  },
+  "styles": [
+    { "style_id": "1", "name": "heading 1", "level": 1 },
+    { "style_id": "2", "name": "heading 2", "level": 2 },
+    { "style_id": "3", "name": "heading 3", "level": 3 }
+  ]
+}
+```
+
+**出力フィールド:**
+
+| フィールド | 説明 |
+| :--- | :--- |
+| `docx.heading_styles` | `docx2json.json` に貼り付けられる設定スニペット。`styleId` と表示名の両方をキーとして収録 |
+| `styles[].style_id` | XML 内部の `w:styleId`（`w:pStyle` で参照される識別子） |
+| `styles[].name` | Word 上の表示スタイル名（`w:name w:val`） |
+| `styles[].level` | 見出しレベル（1〜9）。`w:outlineLvl` の値 + 1 |
+
+> **ヒント:** `inspect-styles` で検出されなかった場合は、そのファイルが Word 標準の見出しスタイルを使っていない可能性があります。
+> `ppr_underline_as_heading` や `run_underline_as_heading` の設定を検討してください。
 
 ### AI・ワークフロー連携コマンド
 
@@ -417,5 +464,6 @@ src/
     ├── mod.rs               # サブコマンドモジュール宣言
     ├── extract_candidates.rs # LLM 向け候補テキスト抽出（→ JSONL）
     ├── inject_tags.rs        # AI タグ注入 + keywords.json バリデーション
+    ├── inspect_styles.rs     # DOCX 見出しスタイル検査（→ heading_styles 設定スニペット）
     └── summarize.rs          # タグ使用統計横断集計（→ tags_summary.json）
 ```

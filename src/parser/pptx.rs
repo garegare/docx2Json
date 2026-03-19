@@ -551,19 +551,7 @@ fn resize_and_compress(data: &[u8], max_px: u32, quality: u8) -> Option<Vec<u8>>
     Some(output)
 }
 
-/// XML要素から属性値を取得する（名前空間プレフィックスを無視してローカル名で検索）
-///
-/// name に ":" が含まれる場合は最後の部分をローカル名として使用する。
-/// ただし "r:embed" など異なる prefix を持つ同名属性が存在しないことが前提。
-fn attr_value(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    let local = name.split(':').next_back().unwrap_or(name);
-    for attr in e.attributes().flatten() {
-        if attr.key.local_name().as_ref() == local.as_bytes() {
-            return String::from_utf8(attr.value.to_vec()).ok();
-        }
-    }
-    None
-}
+use super::attr_value;
 
 /// 名前空間プレフィックスとローカル名を両方指定して属性値を取得する
 ///
