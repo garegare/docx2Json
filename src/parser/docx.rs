@@ -401,6 +401,8 @@ fn parse_document_xml(
             }
 
             // セルプロパティ開始（w:tcPr）: 結合セル属性を読み取るためのコンテキスト
+            // TODO: in_table == 1 のガードによりネストテーブル（in_table >= 2）の
+            //       結合セルは現在無視される。ネストテーブル対応時には合わせて修正すること。
             Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"tcPr" => {
                 in_tcpr = true;
             }
@@ -413,7 +415,9 @@ fn parse_document_xml(
                 if in_tcpr && e.local_name().as_ref() == b"gridSpan" =>
             {
                 if let Some(val) = attr_value(&e, "val") {
-                    current_cell_grid_span = val.parse().unwrap_or(1);
+                    // .max(1): gridSpan=0 は仕様上無効だが、パース成功してしまうため
+                    // 0 のままだと列が push されず行の列数がずれるのを防ぐ
+                    current_cell_grid_span = val.parse::<u32>().unwrap_or(1).max(1);
                 }
             }
 
@@ -989,6 +993,12 @@ fn omath_pop_and_combine(stack: &mut Vec<(String, String)>, child_tag: &str) {
 /// `w:vMerge`（val なし）のみが記録される。継続セルの内容は空なので、
 /// resolve_vmerge でひとつ上の行から同じ列の内容を伝播させる。
 /// gridSpan による列展開後に呼び出すため、列インデックスはすでに揃っている。
+///
+/// # 走査順の注意
+/// **必ず上から順（i = 1, 2, 3 …）に走査すること。**
+/// 行 i の継続セルは `rows[i-1][j]` からコピーするが、`rows[i-1]` 自体も
+/// 継続セルである場合（3行以上の縦結合）、その行がすでに解決済みであることに
+/// 依存している。逆順に走査すると未解決の空文字列が伝播するバグになる。
 fn resolve_vmerge(rows: &mut Vec<Vec<String>>, vmerge: &[Vec<bool>]) {
     for i in 1..rows.len() {
         let cols = rows[i].len();
@@ -1821,6 +1831,86 @@ mod tests {
         assert_eq!(rows[2][0], "A"); // 2段階の伝播（row1→row2 経由）
         assert_eq!(rows[1][1], "C");
         assert_eq!(rows[2][1], "D");
+    }
+
+    /// gridSpan + vMerge の複合: 2列横結合かつ縦結合継続のセルが正しく展開されること
+    #[test]
+    fn test_table_gridspan_and_vmerge_combined() {
+        // 行0: [AB（gridSpan=2, vMerge=restart）, C]  → cols: [AB, AB, C]
+        // 行1: [__（gridSpan=2, vMerge=continue）, D] → cols: [AB, AB, D]（コピー後）
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>S</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:gridSpan w:val="2"/><w:vMerge w:val="restart"/></w:tcPr>
+          <w:p><w:r><w:t>AB</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:p><w:r><w:t>C</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:gridSpan w:val="2"/><w:vMerge/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+        <w:tc>
+          <w:p><w:r><w:t>D</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let tables = collect_table_rows(&sections);
+        assert_eq!(tables.len(), 1);
+        let rows = &tables[0];
+        assert_eq!(rows[0], vec!["AB", "AB", "C"]);
+        assert_eq!(rows[1], vec!["AB", "AB", "D"]); // vMerge 継続セル → "AB" がコピーされる
+    }
+
+    /// 3行にまたがる縦結合: XMLパース経由で3段階の伝播が正しく動作すること
+    #[test]
+    fn test_table_vmerge_three_rows() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>S</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:vMerge w:val="restart"/></w:tcPr>
+          <w:p><w:r><w:t>先頭</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>R1</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:vMerge/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>R2</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:vMerge/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+        <w:tc><w:p><w:r><w:t>R3</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let tables = collect_table_rows(&sections);
+        assert_eq!(tables.len(), 1);
+        let rows = &tables[0];
+        assert_eq!(rows[0][0], "先頭");
+        assert_eq!(rows[1][0], "先頭"); // 2行目にコピー
+        assert_eq!(rows[2][0], "先頭"); // 3行目にも伝播
     }
 
     #[test]
