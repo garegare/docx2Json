@@ -274,8 +274,14 @@ fn parse_document_xml(
     let mut in_tcpr = false;                           // w:tcPr 内か
     let mut current_cell_grid_span: u32 = 1;           // w:gridSpan（横結合列数）
     let mut current_cell_vmerge_continue = false;      // w:vMerge 継続（縦結合）か
+    let mut current_cell_hmerge_continue = false;      // w:hMerge 継続（横結合・旧方式）か
     let mut current_row_vmerge: Vec<bool> = Vec::new(); // 現在行の各セルが vMerge 継続か
+    let mut current_row_hmerge: Vec<bool> = Vec::new(); // 現在行の各セルが hMerge 継続か
     let mut table_row_vmerge: Vec<Vec<bool>> = Vec::new(); // テーブル全行の vMerge フラグ
+    // ---- 行プロパティ状態 ----
+    let mut in_trpr = false;                           // w:trPr 内か
+    let mut current_row_grid_before: u32 = 0;          // w:gridBefore（行頭の空グリッド列数）
+    let mut current_row_grid_after: u32 = 0;           // w:gridAfter（行末の空グリッド列数）
 
     // ---- フィールドコード状態 ----
     // w:fldChar / w:instrText で表現されるフィールドコード（PAGE, DATE, REF 等）の
@@ -391,12 +397,71 @@ fn parse_document_xml(
             Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"tr" => {
                 current_row.clear();
                 current_row_vmerge.clear();
+                current_row_hmerge.clear();
+                current_row_grid_before = 0;
+                current_row_grid_after = 0;
             }
-            // 行終了: 行をテーブルに追加
+            // 行終了: hMerge 解決 → gridBefore/gridAfter 適用 → テーブルに追加
             Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tr" => {
+                // hMerge 継続セルに左隣のセル内容をコピー（横結合・旧方式の解決）
+                // 左から順に走査することで連鎖した継続セルも正しく伝播する
+                for j in 1..current_row.len() {
+                    if current_row_hmerge[j] {
+                        current_row[j] = current_row[j - 1].clone();
+                    }
+                }
+                current_row_hmerge.clear();
+
+                // gridBefore/gridAfter: 行頭・行末に空グリッド列を挿入
+                // インデント行や不揃いな行を持つ表で縦結合の列インデックスを合わせるために必要
+                let grid_before = current_row_grid_before as usize;
+                let grid_after  = current_row_grid_after as usize;
+                if grid_before > 0 || grid_after > 0 {
+                    let capacity = grid_before + current_row.len() + grid_after;
+                    let mut padded_row    = Vec::with_capacity(capacity);
+                    let mut padded_vmerge = Vec::with_capacity(capacity);
+                    for _ in 0..grid_before {
+                        padded_row.push(String::new());
+                        padded_vmerge.push(false);
+                    }
+                    padded_row.extend(std::mem::take(&mut current_row));
+                    padded_vmerge.extend(std::mem::take(&mut current_row_vmerge));
+                    for _ in 0..grid_after {
+                        padded_row.push(String::new());
+                        padded_vmerge.push(false);
+                    }
+                    current_row = padded_row;
+                    current_row_vmerge = padded_vmerge;
+                }
+
                 if !current_row.is_empty() {
                     table_rows.push(std::mem::take(&mut current_row));
                     table_row_vmerge.push(std::mem::take(&mut current_row_vmerge));
+                }
+            }
+
+            // 行プロパティ開始（w:trPr）: gridBefore/gridAfter を読み取るためのコンテキスト
+            Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"trPr" => {
+                in_trpr = true;
+            }
+            Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"trPr" => {
+                in_trpr = false;
+            }
+
+            // 行頭の空グリッド列数（インデント行で縦結合の列インデックスを揃えるために必要）
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_trpr && e.local_name().as_ref() == b"gridBefore" =>
+            {
+                if let Some(val) = attr_value(&e, "val") {
+                    current_row_grid_before = val.parse().unwrap_or(0);
+                }
+            }
+            // 行末の空グリッド列数
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_trpr && e.local_name().as_ref() == b"gridAfter" =>
+            {
+                if let Some(val) = attr_value(&e, "val") {
+                    current_row_grid_after = val.parse().unwrap_or(0);
                 }
             }
 
@@ -432,12 +497,26 @@ fn parse_document_xml(
                 }
             }
 
+            // 横結合（旧方式）: w:hMerge（継続セル）または w:hMerge w:val="restart"（開始セル）
+            // Word 2003 以前の互換モードや他ツール生成の .docx に出現する。
+            // w:gridSpan と異なり、各セルは独立して存在し内容のコピーで表現する。
+            Ok(Event::Empty(e)) | Ok(Event::Start(e))
+                if in_tcpr && e.local_name().as_ref() == b"hMerge" =>
+            {
+                let val = attr_value(&e, "val").unwrap_or_default();
+                // "restart" は横結合の先頭セル（内容あり）、それ以外は継続セル（内容なし）
+                if val != "restart" {
+                    current_cell_hmerge_continue = true;
+                }
+            }
+
             // セル開始
             Ok(Event::Start(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
                 in_table_cell = true;
                 current_cell_text.clear();
                 current_cell_grid_span = 1;
                 current_cell_vmerge_continue = false;
+                current_cell_hmerge_continue = false;
             }
             // セル終了: テキストを行に追加（gridSpan 分だけ繰り返す）
             Ok(Event::End(e)) if in_table == 1 && e.local_name().as_ref() == b"tc" => {
@@ -452,9 +531,11 @@ fn parse_document_xml(
                         .to_string();
                     // gridSpan 分だけ列を埋める（横結合の展開）
                     // vMerge 継続セルは resolve_vmerge で上行の内容に置換される
+                    // hMerge 継続セルは行終了時に左隣の内容に置換される
                     for _ in 0..current_cell_grid_span {
                         current_row.push(text.clone());
                         current_row_vmerge.push(current_cell_vmerge_continue);
+                        current_row_hmerge.push(current_cell_hmerge_continue);
                     }
                     current_cell_text.clear();
                     in_table_cell = false;
@@ -1911,6 +1992,113 @@ mod tests {
         assert_eq!(rows[0][0], "先頭");
         assert_eq!(rows[1][0], "先頭"); // 2行目にコピー
         assert_eq!(rows[2][0], "先頭"); // 3行目にも伝播
+    }
+
+    /// w:hMerge: 旧方式の横結合で継続セルに左隣の内容がコピーされること
+    #[test]
+    fn test_table_hmerge_copies_content_from_left() {
+        // 行0: [A(restart), B(continue), C] → [A, A, C]
+        // 行1: [D, E, F] → 通常行
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>S</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:hMerge w:val="restart"/></w:tcPr>
+          <w:p><w:r><w:t>A</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:hMerge/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+        <w:tc>
+          <w:p><w:r><w:t>C</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>D</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>E</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>F</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let tables = collect_table_rows(&sections);
+        assert_eq!(tables.len(), 1);
+        let rows = &tables[0];
+        assert_eq!(rows[0], vec!["A", "A", "C"]); // hMerge 継続セルに "A" がコピーされる
+        assert_eq!(rows[1], vec!["D", "E", "F"]);
+    }
+
+    /// w:hMerge の連鎖: restart, continue, continue の3セルが全て同じ内容になること
+    #[test]
+    fn test_table_hmerge_chain() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>S</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc>
+          <w:tcPr><w:hMerge w:val="restart"/></w:tcPr>
+          <w:p><w:r><w:t>X</w:t></w:r></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:hMerge w:val="continue"/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+        <w:tc>
+          <w:tcPr><w:hMerge/></w:tcPr>
+          <w:p></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let tables = collect_table_rows(&sections);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0][0], vec!["X", "X", "X"]);
+    }
+
+    /// gridBefore/gridAfter: 行頭・行末に空列が挿入され列インデックスが揃うこと
+    #[test]
+    fn test_table_grid_before_after() {
+        // 行0: 通常行 [A, B, C] (3列)
+        // 行1: gridBefore=1, gridAfter=1 の場合 → ["", A, B, ""]  (4列)
+        //   ただし全行の列数を揃えるのは rows_to_markdown 側の責務なので、
+        //   ここでは rows 配列に正しく空文字が挿入されていることを確認する
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>S</w:t></w:r></w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>C</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:trPr>
+          <w:gridBefore w:val="1"/>
+          <w:gridAfter w:val="1"/>
+        </w:trPr>
+        <w:tc><w:p><w:r><w:t>X</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Y</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+        let sections = parse_document_xml(xml, &empty_images(), &empty_numbering(), &default_config()).unwrap();
+        let tables = collect_table_rows(&sections);
+        assert_eq!(tables.len(), 1);
+        let rows = &tables[0];
+        assert_eq!(rows[0], vec!["A", "B", "C"]);
+        // gridBefore=1 で先頭に空列、gridAfter=1 で末尾に空列が追加される
+        assert_eq!(rows[1], vec!["", "X", "Y", ""]);
     }
 
     #[test]
