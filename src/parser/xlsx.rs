@@ -245,6 +245,10 @@ fn parse_shared_strings(archive: &mut ZipArchive<File>) -> Result<Vec<String>> {
 /// `xl/worksheets/sheet*.xml` を解析してセルグリッドを返す
 ///
 /// 戻り値: 行×列の密な 2D Vec（空セルは空文字列）
+///
+/// `<mergeCells>` を解析し、結合元セルの値を結合範囲全体に展開する。
+/// これにより、ドキュメント風 Excel（神エクセル）で多用されるタイトルや
+/// ラベル用の結合セルが正しく取り込まれる。
 fn parse_worksheet(
     archive: &mut ZipArchive<File>,
     path: &str,
@@ -258,6 +262,9 @@ fn parse_worksheet(
     let mut sparse: HashMap<(usize, usize), String> = HashMap::new();
     let mut max_row = 0usize;
     let mut max_col = 0usize;
+
+    // 結合セル範囲リスト: (min_row, min_col, max_row, max_col)（0-indexed、両端含む）
+    let mut merges: Vec<(usize, usize, usize, usize)> = Vec::new();
 
     // 現在処理中のセル情報
     let mut cur_row = 0usize;
@@ -298,6 +305,17 @@ fn parse_worksheet(
                     }
                     b"v" => in_v = true,
                     b"t" => in_t = true,
+                    // 結合セル範囲を収集: "A1:C3" 形式の ref 属性を解析
+                    b"mergeCell" => {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.local_name().as_ref() == b"ref" {
+                                let ref_str = decode_bytes(&attr.value);
+                                if let Some(mr) = parse_merge_range(&ref_str) {
+                                    merges.push(mr);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -329,6 +347,32 @@ fn parse_worksheet(
     for ((r, c), val) in sparse {
         grid[r][c] = val;
     }
+
+    // 結合セル展開: 結合元（左上）の値を結合範囲全体にコピー
+    // これにより空文字になっていた結合継続セルが正しい値を持つ
+    for (min_row, min_col, max_row, max_col) in &merges {
+        // 結合元の値を取得（空なら展開しない）
+        let origin = grid
+            .get(*min_row)
+            .and_then(|r| r.get(*min_col))
+            .cloned()
+            .unwrap_or_default();
+        if origin.is_empty() {
+            continue;
+        }
+        for r in *min_row..=*max_row {
+            for c in *min_col..=*max_col {
+                if (r, c) == (*min_row, *min_col) {
+                    continue; // 結合元はスキップ
+                }
+                // グリッド範囲内のセルのみ更新（壊れた merge 指定への防御）
+                if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    cell.clone_from(&origin);
+                }
+            }
+        }
+    }
+
     Ok(grid)
 }
 
@@ -413,6 +457,28 @@ fn col_index(cell_ref: &str) -> usize {
         .saturating_sub(1)
 }
 
+/// "A1:C3" 形式のセル範囲文字列を `(min_row, min_col, max_row, max_col)`（0-indexed）に変換する
+fn parse_merge_range(ref_str: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut parts = ref_str.splitn(2, ':');
+    let (sr, sc) = parse_cell_address(parts.next()?)?;
+    let (er, ec) = parse_cell_address(parts.next()?)?;
+    Some((sr, sc, er, ec))
+}
+
+/// "A1"、"AB12" 等のセルアドレス文字列を `(row, col)`（0-indexed）に変換する
+fn parse_cell_address(addr: &str) -> Option<(usize, usize)> {
+    let col_str: String = addr.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let row_str: String = addr.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let col = col_str
+        .chars()
+        .fold(0usize, |acc, c| {
+            acc * 26 + (c.to_ascii_uppercase() as usize - b'A' as usize + 1)
+        })
+        .checked_sub(1)?;
+    let row: usize = row_str.parse::<usize>().ok()?.checked_sub(1)?;
+    Some((row, col))
+}
+
 /// `xl/_rels/workbook.xml.rels` の Target パスを ZIP 内絶対パスに解決する
 ///
 /// - 絶対パス（`/xl/worksheets/sheet1.xml`）→ 先頭スラッシュを除去
@@ -440,4 +506,103 @@ fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<String> 
         .read_to_string(&mut buf)
         .with_context(|| format!("ZIPエントリの読み込みに失敗: {name}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_col_index() {
+        assert_eq!(col_index("A1"), 0);
+        assert_eq!(col_index("Z1"), 25);
+        assert_eq!(col_index("AA1"), 26);
+        assert_eq!(col_index("AB1"), 27);
+    }
+
+    #[test]
+    fn test_parse_cell_address() {
+        assert_eq!(parse_cell_address("A1"), Some((0, 0)));
+        assert_eq!(parse_cell_address("C3"), Some((2, 2)));
+        assert_eq!(parse_cell_address("AA10"), Some((9, 26)));
+        assert_eq!(parse_cell_address(""), None);
+    }
+
+    #[test]
+    fn test_parse_merge_range() {
+        assert_eq!(parse_merge_range("A1:C3"), Some((0, 0, 2, 2)));
+        assert_eq!(parse_merge_range("B2:D4"), Some((1, 1, 3, 3)));
+        // 単一セル（A1:A1）も受け付ける
+        assert_eq!(parse_merge_range("A1:A1"), Some((0, 0, 0, 0)));
+        // コロンなし → None
+        assert_eq!(parse_merge_range("A1"), None);
+    }
+
+    /// 結合セル展開のロジックを単体で検証するヘルパー
+    /// parse_worksheet 内の展開コードと同一ロジック
+    fn apply_merges(grid: &mut Vec<Vec<String>>, merges: &[(usize, usize, usize, usize)]) {
+        for (min_row, min_col, max_row, max_col) in merges {
+            let origin = grid
+                .get(*min_row)
+                .and_then(|r| r.get(*min_col))
+                .cloned()
+                .unwrap_or_default();
+            if origin.is_empty() {
+                continue;
+            }
+            for r in *min_row..=*max_row {
+                for c in *min_col..=*max_col {
+                    if (r, c) == (*min_row, *min_col) {
+                        continue;
+                    }
+                    if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                        cell.clone_from(&origin);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_merge_expansion_horizontal() {
+        // A1:C1 の横結合: "タイトル" が B1, C1 にコピーされる
+        let mut grid = vec![
+            vec!["タイトル".to_string(), String::new(), String::new()],
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        ];
+        apply_merges(&mut grid, &[(0, 0, 0, 2)]);
+        assert_eq!(grid[0], vec!["タイトル", "タイトル", "タイトル"]);
+        assert_eq!(grid[1], vec!["A", "B", "C"]); // 他行は変化なし
+    }
+
+    #[test]
+    fn test_merge_expansion_vertical() {
+        // A1:A3 の縦結合: "ラベル" が A2, A3 にコピーされる
+        let mut grid = vec![
+            vec!["ラベル".to_string(), "X".to_string()],
+            vec![String::new(), "Y".to_string()],
+            vec![String::new(), "Z".to_string()],
+        ];
+        apply_merges(&mut grid, &[(0, 0, 2, 0)]);
+        assert_eq!(grid[0][0], "ラベル");
+        assert_eq!(grid[1][0], "ラベル");
+        assert_eq!(grid[2][0], "ラベル");
+    }
+
+    #[test]
+    fn test_merge_expansion_empty_origin_skipped() {
+        // 結合元が空の場合は展開しない
+        let mut grid = vec![vec![String::new(), String::new(), String::new()]];
+        apply_merges(&mut grid, &[(0, 0, 0, 2)]);
+        assert_eq!(grid[0], vec!["", "", ""]);
+    }
+
+    #[test]
+    fn test_merge_expansion_out_of_bounds_safe() {
+        // 壊れた merge 指定でもパニックしない
+        let mut grid = vec![vec!["値".to_string()]];
+        apply_merges(&mut grid, &[(0, 0, 5, 5)]); // グリッド範囲外
+        // グリッド内の (0,0) は変化なし、範囲外への書き込みは無視される
+        assert_eq!(grid[0][0], "値");
+    }
 }
