@@ -9,7 +9,7 @@ use quick_xml::Reader;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::models::{Document, Section};
+use crate::models::{Document, Element, ElementMetadata, Section};
 
 /// XLSXファイルを解析してDocumentを返す
 ///
@@ -93,6 +93,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             context_path: Vec::new(),
             heading: name.to_string(),
             body_text: grid_to_markdown(&rows),
+            elements: grid_to_elements(&rows),
             assets: Vec::new(),
             children: Vec::new(),
             ..Default::default()
@@ -120,6 +121,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
                 context_path: Vec::new(), // fill_context_path() で後から設定
                 heading: format!("{} [行 {}–{}]", name, start, end),
                 body_text: grid_to_markdown(&child_rows),
+                elements: grid_to_elements(&child_rows),
                 assets: Vec::new(),
                 children: Vec::new(),
                 ..Default::default()
@@ -127,16 +129,84 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
         })
         .collect();
 
+    let summary = format!(
+        "（全 {} 行 / {} 行ずつ {} チャンクに分割）",
+        data_row_count, max_rows, chunk_count
+    );
     Section {
         context_path: Vec::new(),
         heading: name.to_string(),
-        body_text: format!(
-            "（全 {} 行 / {} 行ずつ {} チャンクに分割）",
-            data_row_count, max_rows, chunk_count
-        ),
+        body_text: summary.clone(),
+        elements: vec![crate::models::Element::Paragraph {
+            text: summary,
+            metadata: crate::models::ElementMetadata::default(),
+        }],
         assets: Vec::new(),
         children,
         ..Default::default()
+    }
+}
+
+/// グリッドを構造化 Element のリストに変換する
+///
+/// 空行を区切りとして「ブロック」を検出し、ブロックごとに Element を生成する:
+/// - 1行かつ非空セルが1つのみ → `Paragraph`（タイトル行・ラベル等）
+/// - それ以外 → `Table`（複数行 or 複数セル）
+fn grid_to_elements(rows: &[Vec<String>]) -> Vec<Element> {
+    split_into_blocks(rows)
+        .into_iter()
+        .map(block_to_element)
+        .collect()
+}
+
+/// グリッドを空行区切りでブロックに分割する
+///
+/// 全セルが空文字の行を区切りとして扱い、連続する非空行をひとまとめにする。
+fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
+    let mut blocks: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut current: Vec<Vec<String>> = Vec::new();
+
+    for row in rows {
+        if row.iter().all(|s| s.is_empty()) {
+            if !current.is_empty() {
+                blocks.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(row.clone());
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+/// ブロック（非空行の連続）から Element を生成する
+///
+/// 1行で以下のいずれかに該当する場合は `Paragraph` として扱う:
+/// - 非空セルが1つのみ（通常の単一セルタイトル）
+/// - 非空セルが複数あるが全て同一値（横結合タイトルの展開結果）
+///
+/// それ以外は `Table` として扱う。
+fn block_to_element(block: Vec<Vec<String>>) -> Element {
+    if block.len() == 1 {
+        let non_empty: Vec<&String> = block[0].iter().filter(|s| !s.is_empty()).collect();
+        let is_title = match non_empty.len() {
+            0 => false,
+            1 => true,
+            // 全セルが同一値 → 横結合タイトルが展開されたもの
+            _ => non_empty.windows(2).all(|w| w[0] == w[1]),
+        };
+        if is_title {
+            return Element::Paragraph {
+                text: non_empty[0].clone(),
+                metadata: ElementMetadata::default(),
+            };
+        }
+    }
+    Element::Table {
+        rows: block,
+        metadata: ElementMetadata::default(),
     }
 }
 
@@ -220,19 +290,27 @@ fn parse_shared_strings(archive: &mut ZipArchive<File>) -> Result<Vec<String>> {
     reader.config_mut().trim_text(false);
 
     let mut in_si = false;
+    let mut in_rph = false; // <rPh>（ルビ・読み仮名）内は読み飛ばす
     let mut current = String::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == b"si" => {
                 in_si = true;
+                in_rph = false;
                 current.clear();
             }
             Event::End(e) if e.local_name().as_ref() == b"si" => {
                 strings.push(current.trim().to_string());
                 in_si = false;
             }
-            Event::Text(e) if in_si => {
+            Event::Start(e) if in_si && e.local_name().as_ref() == b"rPh" => {
+                in_rph = true;
+            }
+            Event::End(e) if in_si && e.local_name().as_ref() == b"rPh" => {
+                in_rph = false;
+            }
+            Event::Text(e) if in_si && !in_rph => {
                 current.push_str(&e.unescape().unwrap_or_default());
             }
             Event::Eof => break,
@@ -245,6 +323,10 @@ fn parse_shared_strings(archive: &mut ZipArchive<File>) -> Result<Vec<String>> {
 /// `xl/worksheets/sheet*.xml` を解析してセルグリッドを返す
 ///
 /// 戻り値: 行×列の密な 2D Vec（空セルは空文字列）
+///
+/// `<mergeCells>` を解析し、結合元セルの値を結合範囲全体に展開する。
+/// これにより、ドキュメント風 Excel（神エクセル）で多用されるタイトルや
+/// ラベル用の結合セルが正しく取り込まれる。
 fn parse_worksheet(
     archive: &mut ZipArchive<File>,
     path: &str,
@@ -258,6 +340,9 @@ fn parse_worksheet(
     let mut sparse: HashMap<(usize, usize), String> = HashMap::new();
     let mut max_row = 0usize;
     let mut max_col = 0usize;
+
+    // 結合セル範囲リスト: (min_row, min_col, max_row, max_col)（0-indexed、両端含む）
+    let mut merges: Vec<(usize, usize, usize, usize)> = Vec::new();
 
     // 現在処理中のセル情報
     let mut cur_row = 0usize;
@@ -298,6 +383,17 @@ fn parse_worksheet(
                     }
                     b"v" => in_v = true,
                     b"t" => in_t = true,
+                    // 結合セル範囲を収集: "A1:C3" 形式の ref 属性を解析
+                    b"mergeCell" => {
+                        for attr in e.attributes().flatten() {
+                            if attr.key.local_name().as_ref() == b"ref" {
+                                let ref_str = decode_bytes(&attr.value);
+                                if let Some(mr) = parse_merge_range(&ref_str) {
+                                    merges.push(mr);
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -329,6 +425,8 @@ fn parse_worksheet(
     for ((r, c), val) in sparse {
         grid[r][c] = val;
     }
+
+    expand_merges(&mut grid, &merges);
     Ok(grid)
 }
 
@@ -400,17 +498,63 @@ fn escape_cell(s: &str) -> String {
 
 // ---- ユーティリティ ----
 
+/// 結合セル範囲リストに従い、グリッドの結合元（左上）の値を範囲全体にコピーする
+///
+/// - 結合元が空文字の場合は展開しない
+/// - グリッド範囲外の merge 指定は無視する（破損ファイルへの防御）
+fn expand_merges(grid: &mut [Vec<String>], merges: &[(usize, usize, usize, usize)]) {
+    for (min_row, min_col, max_row, max_col) in merges {
+        let origin = grid
+            .get(*min_row)
+            .and_then(|r| r.get(*min_col))
+            .cloned()
+            .unwrap_or_default();
+        if origin.is_empty() {
+            continue;
+        }
+        for r in *min_row..=*max_row {
+            for c in *min_col..=*max_col {
+                if (r, c) == (*min_row, *min_col) {
+                    continue; // 結合元はスキップ
+                }
+                if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    cell.clone_from(&origin);
+                }
+            }
+        }
+    }
+}
+
 /// セル参照（"A1"、"AB12" 等）からゼロ始まりの列インデックスを返す
 ///
 /// A=0, B=1, …, Z=25, AA=26, AB=27, …
 fn col_index(cell_ref: &str) -> usize {
-    cell_ref
+    // parse_cell_address でアドレス全体を解析し、列インデックスのみを返す
+    parse_cell_address(cell_ref)
+        .map(|(_row, col)| col)
+        .unwrap_or(0)
+}
+
+/// "A1:C3" 形式のセル範囲文字列を `(min_row, min_col, max_row, max_col)`（0-indexed）に変換する
+fn parse_merge_range(ref_str: &str) -> Option<(usize, usize, usize, usize)> {
+    let mut parts = ref_str.splitn(2, ':');
+    let (sr, sc) = parse_cell_address(parts.next()?)?;
+    let (er, ec) = parse_cell_address(parts.next()?)?;
+    Some((sr, sc, er, ec))
+}
+
+/// "A1"、"AB12" 等のセルアドレス文字列を `(row, col)`（0-indexed）に変換する
+fn parse_cell_address(addr: &str) -> Option<(usize, usize)> {
+    let col_str: String = addr.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let row_str: String = addr.chars().skip_while(|c| c.is_ascii_alphabetic()).collect();
+    let col = col_str
         .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
         .fold(0usize, |acc, c| {
             acc * 26 + (c.to_ascii_uppercase() as usize - b'A' as usize + 1)
         })
-        .saturating_sub(1)
+        .checked_sub(1)?;
+    let row: usize = row_str.parse::<usize>().ok()?.checked_sub(1)?;
+    Some((row, col))
 }
 
 /// `xl/_rels/workbook.xml.rels` の Target パスを ZIP 内絶対パスに解決する
@@ -440,4 +584,187 @@ fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<String> 
         .read_to_string(&mut buf)
         .with_context(|| format!("ZIPエントリの読み込みに失敗: {name}"))?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_col_index() {
+        assert_eq!(col_index("A1"), 0);
+        assert_eq!(col_index("Z1"), 25);
+        assert_eq!(col_index("AA1"), 26);
+        assert_eq!(col_index("AB1"), 27);
+    }
+
+    #[test]
+    fn test_parse_cell_address() {
+        assert_eq!(parse_cell_address("A1"), Some((0, 0)));
+        assert_eq!(parse_cell_address("C3"), Some((2, 2)));
+        assert_eq!(parse_cell_address("AA10"), Some((9, 26)));
+        assert_eq!(parse_cell_address(""), None);
+    }
+
+    #[test]
+    fn test_parse_merge_range() {
+        assert_eq!(parse_merge_range("A1:C3"), Some((0, 0, 2, 2)));
+        assert_eq!(parse_merge_range("B2:D4"), Some((1, 1, 3, 3)));
+        // 単一セル（A1:A1）も受け付ける
+        assert_eq!(parse_merge_range("A1:A1"), Some((0, 0, 0, 0)));
+        // コロンなし → None
+        assert_eq!(parse_merge_range("A1"), None);
+    }
+
+    #[test]
+    fn test_merge_expansion_horizontal() {
+        // A1:C1 の横結合: "タイトル" が B1, C1 にコピーされる
+        let mut grid = vec![
+            vec!["タイトル".to_string(), String::new(), String::new()],
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+        ];
+        expand_merges(&mut grid, &[(0, 0, 0, 2)]);
+        assert_eq!(grid[0], vec!["タイトル", "タイトル", "タイトル"]);
+        assert_eq!(grid[1], vec!["A", "B", "C"]); // 他行は変化なし
+    }
+
+    #[test]
+    fn test_merge_expansion_vertical() {
+        // A1:A3 の縦結合: "ラベル" が A2, A3 にコピーされる
+        let mut grid = vec![
+            vec!["ラベル".to_string(), "X".to_string()],
+            vec![String::new(), "Y".to_string()],
+            vec![String::new(), "Z".to_string()],
+        ];
+        expand_merges(&mut grid, &[(0, 0, 2, 0)]);
+        assert_eq!(grid[0][0], "ラベル");
+        assert_eq!(grid[1][0], "ラベル");
+        assert_eq!(grid[2][0], "ラベル");
+    }
+
+    #[test]
+    fn test_merge_expansion_empty_origin_skipped() {
+        // 結合元が空の場合は展開しない
+        let mut grid = vec![vec![String::new(), String::new(), String::new()]];
+        expand_merges(&mut grid, &[(0, 0, 0, 2)]);
+        assert_eq!(grid[0], vec!["", "", ""]);
+    }
+
+    // ---- grid_to_elements / split_into_blocks / block_to_element のテスト ----
+
+    #[test]
+    fn test_split_into_blocks_single_block() {
+        let rows = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        let blocks = split_into_blocks(&rows);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), 2);
+    }
+
+    #[test]
+    fn test_split_into_blocks_two_blocks() {
+        let rows = vec![
+            vec!["タイトル".to_string(), "".to_string()],
+            vec!["".to_string(), "".to_string()], // 空行
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        let blocks = split_into_blocks(&rows);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].len(), 1);
+        assert_eq!(blocks[1].len(), 2);
+    }
+
+    #[test]
+    fn test_split_into_blocks_empty() {
+        let rows: Vec<Vec<String>> = vec![];
+        assert_eq!(split_into_blocks(&rows).len(), 0);
+    }
+
+    #[test]
+    fn test_block_to_element_paragraph() {
+        // 1行・1セル → Paragraph
+        let block = vec![vec!["申請書".to_string(), "".to_string(), "".to_string()]];
+        match block_to_element(block) {
+            Element::Paragraph { text, .. } => assert_eq!(text, "申請書"),
+            other => panic!("Expected Paragraph, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_multi_row() {
+        // 複数行 → Table
+        let block = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        match block_to_element(block) {
+            Element::Table { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_multi_cell() {
+        // 1行・複数セルで値が異なる → Table
+        let block = vec![vec!["部署".to_string(), "総務部".to_string()]];
+        match block_to_element(block) {
+            Element::Table { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_paragraph_from_merged_title() {
+        // 横結合タイトルの展開結果（全セルが同一値）→ Paragraph
+        let block = vec![vec![
+            "API仕様書".to_string(),
+            "API仕様書".to_string(),
+            "API仕様書".to_string(),
+        ]];
+        match block_to_element(block) {
+            Element::Paragraph { text, .. } => assert_eq!(text, "API仕様書"),
+            other => panic!("Expected Paragraph, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_when_values_differ() {
+        // 1行・複数セルで値が異なる → Table（誤検知しない）
+        let block = vec![vec![
+            "パラメータ名".to_string(),
+            "型".to_string(),
+            "必須".to_string(),
+        ]];
+        match block_to_element(block) {
+            Element::Table { .. } => {}
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_grid_to_elements_mixed() {
+        // タイトル行 + 空行 + データテーブル → [Paragraph, Table]
+        let rows = vec![
+            vec!["申請書".to_string(), "".to_string()],
+            vec!["".to_string(), "".to_string()],
+            vec!["部署".to_string(), "総務部".to_string()],
+            vec!["担当".to_string(), "田中".to_string()],
+        ];
+        let elements = grid_to_elements(&rows);
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[0], Element::Paragraph { .. }));
+        assert!(matches!(elements[1], Element::Table { .. }));
+    }
+
+    #[test]
+    fn test_merge_expansion_out_of_bounds_safe() {
+        // 壊れた merge 指定でもパニックしない
+        let mut grid = vec![vec!["値".to_string()]];
+        expand_merges(&mut grid, &[(0, 0, 5, 5)]); // グリッド範囲外
+        // グリッド内の (0,0) は変化なし、範囲外への書き込みは無視される
+        assert_eq!(grid[0][0], "値");
+    }
 }
