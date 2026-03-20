@@ -114,7 +114,7 @@ fn write_element(
             writeln!(out, "{}", adoc).unwrap();
         }
 
-        Element::Table { rows, .. } => {
+        Element::Table { rows, merges, .. } => {
             if rows.is_empty() {
                 return;
             }
@@ -128,15 +128,52 @@ fn write_element(
             writeln!(out, r#"[cols="{}",options="header"]"#, cols.join(",")).unwrap();
             writeln!(out, "|===").unwrap();
 
-            for (i, row) in rows.iter().enumerate() {
-                // 先頭行はヘッダー（空行で区切る）
-                if i == 1 {
-                    writeln!(out).unwrap();
+            if merges.is_empty() {
+                // 結合なし: コンパクトな1行形式
+                for (i, row) in rows.iter().enumerate() {
+                    if i == 1 {
+                        writeln!(out).unwrap();
+                    }
+                    let cells: Vec<String> = (0..col_count)
+                        .map(|c| escape_cell(row.get(c).map(|s| s.as_str()).unwrap_or("")))
+                        .collect();
+                    writeln!(out, "| {}", cells.join(" | ")).unwrap();
                 }
-                let cells: Vec<String> = (0..col_count)
-                    .map(|c| escape_cell(row.get(c).map(|s| s.as_str()).unwrap_or("")))
+            } else {
+                // 結合あり: 1セル1行形式 + スパン記法
+                use std::collections::{HashMap, HashSet};
+                let span_map: HashMap<(usize, usize), (usize, usize)> = merges
+                    .iter()
+                    .map(|&(r, c, rs, cs)| ((r, c), (rs, cs)))
                     .collect();
-                writeln!(out, "| {}", cells.join(" | ")).unwrap();
+                let mut covered: HashSet<(usize, usize)> = HashSet::new();
+                for &(r, c, rs, cs) in merges {
+                    for dr in 0..rs {
+                        for dc in 0..cs {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            covered.insert((r + dr, c + dc));
+                        }
+                    }
+                }
+                for (row_idx, row) in rows.iter().enumerate() {
+                    if row_idx == 1 {
+                        writeln!(out).unwrap();
+                    }
+                    for col_idx in 0..col_count {
+                        if covered.contains(&(row_idx, col_idx)) {
+                            continue;
+                        }
+                        let text =
+                            escape_cell(row.get(col_idx).map(|s| s.as_str()).unwrap_or(""));
+                        let prefix = span_map
+                            .get(&(row_idx, col_idx))
+                            .map(|&(rs, cs)| cell_span_prefix(cs, rs))
+                            .unwrap_or_default();
+                        writeln!(out, "{}| {}", prefix, text).unwrap();
+                    }
+                }
             }
             writeln!(out, "|===").unwrap();
             writeln!(out).unwrap();
@@ -162,6 +199,21 @@ fn write_element(
                 writeln!(out).unwrap();
             }
         }
+    }
+}
+
+/// AsciiDoc テーブルセルのスパン記法プレフィックスを生成する
+///
+/// - colspan 2, rowspan 1 → `"2+"`
+/// - colspan 1, rowspan 3 → `".3+"`
+/// - colspan 2, rowspan 3 → `"2.3+"`
+/// - colspan 1, rowspan 1 → `""` (スパンなし)
+fn cell_span_prefix(colspan: usize, rowspan: usize) -> String {
+    match (colspan > 1, rowspan > 1) {
+        (true, true) => format!("{}.{}+", colspan, rowspan),
+        (true, false) => format!("{}+", colspan),
+        (false, true) => format!(".{}+", rowspan),
+        (false, false) => String::new(),
     }
 }
 

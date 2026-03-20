@@ -72,6 +72,10 @@ pub enum Element {
         #[serde(default)]
         metadata: ElementMetadata,
         rows: Vec<Vec<String>>,
+        /// セル結合情報: [(row, col, rowspan, colspan)] ブロックローカル 0-based。
+        /// 結合なしの場合は省略される（後方互換）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        merges: Vec<(usize, usize, usize, usize)>,
     },
     /// 画像等のアセット参照（assets 配列の id と対応）
     AssetRef {
