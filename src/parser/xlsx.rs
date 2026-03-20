@@ -9,7 +9,7 @@ use quick_xml::Reader;
 use zip::ZipArchive;
 
 use crate::config::Config;
-use crate::models::{Document, Section};
+use crate::models::{Document, Element, ElementMetadata, Section};
 
 /// XLSXファイルを解析してDocumentを返す
 ///
@@ -93,6 +93,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             context_path: Vec::new(),
             heading: name.to_string(),
             body_text: grid_to_markdown(&rows),
+            elements: grid_to_elements(&rows),
             assets: Vec::new(),
             children: Vec::new(),
             ..Default::default()
@@ -120,6 +121,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
                 context_path: Vec::new(), // fill_context_path() で後から設定
                 heading: format!("{} [行 {}–{}]", name, start, end),
                 body_text: grid_to_markdown(&child_rows),
+                elements: grid_to_elements(&child_rows),
                 assets: Vec::new(),
                 children: Vec::new(),
                 ..Default::default()
@@ -137,6 +139,61 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
         assets: Vec::new(),
         children,
         ..Default::default()
+    }
+}
+
+/// グリッドを構造化 Element のリストに変換する
+///
+/// 空行を区切りとして「ブロック」を検出し、ブロックごとに Element を生成する:
+/// - 1行かつ非空セルが1つのみ → `Paragraph`（タイトル行・ラベル等）
+/// - それ以外 → `Table`（複数行 or 複数セル）
+fn grid_to_elements(rows: &[Vec<String>]) -> Vec<Element> {
+    split_into_blocks(rows)
+        .into_iter()
+        .map(block_to_element)
+        .collect()
+}
+
+/// グリッドを空行区切りでブロックに分割する
+///
+/// 全セルが空文字の行を区切りとして扱い、連続する非空行をひとまとめにする。
+fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
+    let mut blocks: Vec<Vec<Vec<String>>> = Vec::new();
+    let mut current: Vec<Vec<String>> = Vec::new();
+
+    for row in rows {
+        if row.iter().all(|s| s.is_empty()) {
+            if !current.is_empty() {
+                blocks.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(row.clone());
+        }
+    }
+    if !current.is_empty() {
+        blocks.push(current);
+    }
+    blocks
+}
+
+/// ブロック（非空行の連続）から Element を生成する
+///
+/// 1行かつ非空セルが1つのみのブロックは `Paragraph` として扱う。
+/// それ以外は `Table` として扱う。
+fn block_to_element(block: Vec<Vec<String>>) -> Element {
+    if block.len() == 1 {
+        let non_empty: Vec<&String> = block[0].iter().filter(|s| !s.is_empty()).collect();
+        if non_empty.len() == 1 {
+            return Element::Paragraph {
+                text: non_empty[0].clone(),
+                metadata: ElementMetadata::default(),
+            };
+        }
+    }
+    Element::Table {
+        rows: block,
+        metadata: ElementMetadata::default(),
     }
 }
 
@@ -595,6 +652,87 @@ mod tests {
         let mut grid = vec![vec![String::new(), String::new(), String::new()]];
         apply_merges(&mut grid, &[(0, 0, 0, 2)]);
         assert_eq!(grid[0], vec!["", "", ""]);
+    }
+
+    // ---- grid_to_elements / split_into_blocks / block_to_element のテスト ----
+
+    #[test]
+    fn test_split_into_blocks_single_block() {
+        let rows = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        let blocks = split_into_blocks(&rows);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].len(), 2);
+    }
+
+    #[test]
+    fn test_split_into_blocks_two_blocks() {
+        let rows = vec![
+            vec!["タイトル".to_string(), "".to_string()],
+            vec!["".to_string(), "".to_string()], // 空行
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        let blocks = split_into_blocks(&rows);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].len(), 1);
+        assert_eq!(blocks[1].len(), 2);
+    }
+
+    #[test]
+    fn test_split_into_blocks_empty() {
+        let rows: Vec<Vec<String>> = vec![];
+        assert_eq!(split_into_blocks(&rows).len(), 0);
+    }
+
+    #[test]
+    fn test_block_to_element_paragraph() {
+        // 1行・1セル → Paragraph
+        let block = vec![vec!["申請書".to_string(), "".to_string(), "".to_string()]];
+        match block_to_element(block) {
+            Element::Paragraph { text, .. } => assert_eq!(text, "申請書"),
+            other => panic!("Expected Paragraph, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_multi_row() {
+        // 複数行 → Table
+        let block = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["1".to_string(), "2".to_string()],
+        ];
+        match block_to_element(block) {
+            Element::Table { rows, .. } => assert_eq!(rows.len(), 2),
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_multi_cell() {
+        // 1行・複数セル → Table
+        let block = vec![vec!["部署".to_string(), "総務部".to_string()]];
+        match block_to_element(block) {
+            Element::Table { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_grid_to_elements_mixed() {
+        // タイトル行 + 空行 + データテーブル → [Paragraph, Table]
+        let rows = vec![
+            vec!["申請書".to_string(), "".to_string()],
+            vec!["".to_string(), "".to_string()],
+            vec!["部署".to_string(), "総務部".to_string()],
+            vec!["担当".to_string(), "田中".to_string()],
+        ];
+        let elements = grid_to_elements(&rows);
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(elements[0], Element::Paragraph { .. }));
+        assert!(matches!(elements[1], Element::Table { .. }));
     }
 
     #[test]
