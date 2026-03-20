@@ -290,19 +290,27 @@ fn parse_shared_strings(archive: &mut ZipArchive<File>) -> Result<Vec<String>> {
     reader.config_mut().trim_text(false);
 
     let mut in_si = false;
+    let mut in_rph = false; // <rPh>（ルビ・読み仮名）内は読み飛ばす
     let mut current = String::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(e) if e.local_name().as_ref() == b"si" => {
                 in_si = true;
+                in_rph = false;
                 current.clear();
             }
             Event::End(e) if e.local_name().as_ref() == b"si" => {
                 strings.push(current.trim().to_string());
                 in_si = false;
             }
-            Event::Text(e) if in_si => {
+            Event::Start(e) if in_si && e.local_name().as_ref() == b"rPh" => {
+                in_rph = true;
+            }
+            Event::End(e) if in_si && e.local_name().as_ref() == b"rPh" => {
+                in_rph = false;
+            }
+            Event::Text(e) if in_si && !in_rph => {
                 current.push_str(&e.unescape().unwrap_or_default());
             }
             Event::Eof => break,
