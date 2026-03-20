@@ -183,12 +183,21 @@ fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
 
 /// ブロック（非空行の連続）から Element を生成する
 ///
-/// 1行かつ非空セルが1つのみのブロックは `Paragraph` として扱う。
+/// 1行で以下のいずれかに該当する場合は `Paragraph` として扱う:
+/// - 非空セルが1つのみ（通常の単一セルタイトル）
+/// - 非空セルが複数あるが全て同一値（横結合タイトルの展開結果）
+///
 /// それ以外は `Table` として扱う。
 fn block_to_element(block: Vec<Vec<String>>) -> Element {
     if block.len() == 1 {
         let non_empty: Vec<&String> = block[0].iter().filter(|s| !s.is_empty()).collect();
-        if non_empty.len() == 1 {
+        let is_title = match non_empty.len() {
+            0 => false,
+            1 => true,
+            // 全セルが同一値 → 横結合タイトルが展開されたもの
+            _ => non_empty.windows(2).all(|w| w[0] == w[1]),
+        };
+        if is_title {
             return Element::Paragraph {
                 text: non_empty[0].clone(),
                 metadata: ElementMetadata::default(),
@@ -691,10 +700,38 @@ mod tests {
 
     #[test]
     fn test_block_to_element_table_multi_cell() {
-        // 1行・複数セル → Table
+        // 1行・複数セルで値が異なる → Table
         let block = vec![vec!["部署".to_string(), "総務部".to_string()]];
         match block_to_element(block) {
             Element::Table { rows, .. } => assert_eq!(rows.len(), 1),
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_paragraph_from_merged_title() {
+        // 横結合タイトルの展開結果（全セルが同一値）→ Paragraph
+        let block = vec![vec![
+            "API仕様書".to_string(),
+            "API仕様書".to_string(),
+            "API仕様書".to_string(),
+        ]];
+        match block_to_element(block) {
+            Element::Paragraph { text, .. } => assert_eq!(text, "API仕様書"),
+            other => panic!("Expected Paragraph, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_table_when_values_differ() {
+        // 1行・複数セルで値が異なる → Table（誤検知しない）
+        let block = vec![vec![
+            "パラメータ名".to_string(),
+            "型".to_string(),
+            "必須".to_string(),
+        ]];
+        match block_to_element(block) {
+            Element::Table { .. } => {}
             other => panic!("Expected Table, got {:?}", other),
         }
     }
