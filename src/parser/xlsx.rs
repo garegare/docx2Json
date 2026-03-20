@@ -502,7 +502,7 @@ fn escape_cell(s: &str) -> String {
 ///
 /// - 結合元が空文字の場合は展開しない
 /// - グリッド範囲外の merge 指定は無視する（破損ファイルへの防御）
-fn expand_merges(grid: &mut Vec<Vec<String>>, merges: &[(usize, usize, usize, usize)]) {
+fn expand_merges(grid: &mut [Vec<String>], merges: &[(usize, usize, usize, usize)]) {
     for (min_row, min_col, max_row, max_col) in merges {
         let origin = grid
             .get(*min_row)
