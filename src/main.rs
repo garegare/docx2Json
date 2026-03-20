@@ -35,6 +35,8 @@ enum Commands {
     InspectStyles(commands::inspect_styles::Args),
     /// 複数の document.json からタグ使用統計を集計する
     Summarize(commands::summarize::Args),
+    /// document.json を AsciiDoc 形式に変換する
+    ToAsciidoc(commands::to_asciidoc::Args),
 }
 
 /// `parse` サブコマンド（またはサブコマンドなし時の後方互換）の引数
@@ -108,6 +110,12 @@ fn main() {
         }
         Some(Commands::Summarize(args)) => {
             if let Err(e) = commands::summarize::run(args) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::ToAsciidoc(args)) => {
+            if let Err(e) = commands::to_asciidoc::run(args) {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);
             }
