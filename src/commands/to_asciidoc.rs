@@ -126,12 +126,18 @@ fn write_element(
             // Step 2: 隣接する排他的列を階層インデントで統合
             let (rows, merges) = merge_exclusive_cols(&rows, &merges, "　");
 
+            // Step 2b: 幽霊列（全セルが空またはカバー済みで自身はマージ開始でない）を除去
+            let (rows, merges) = remove_phantom_cols(&rows, &merges);
+
+            // Step 3: 末尾の全空行を除去（rowspan の端数により生じる空行対策）
+            let (rows, merges) = trim_trailing_empty_rows(&rows, &merges);
+
             let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
             if col_count == 0 {
                 return;
             }
 
-            // Step 3: 全幅ヘッダー行で分割して出力
+            // Step 4: 全幅ヘッダー行で分割して出力
             write_table_with_headers(out, &rows, &merges, col_count);
         }
 
@@ -185,6 +191,9 @@ fn build_span_and_covered(
 /// 全幅ヘッダー行でテーブルを分割し、ヘッダー行は太字段落として出力する。
 ///
 /// 全幅ヘッダー行 = 可視セルが1つだけ、かつそのセルの colspan が全列数 - 1 以上の行。
+///
+/// 分割後の 2 番目以降のサブテーブルには最初のデータセグメントの行を
+/// AsciiDoc ヘッダー行として繰り返す（列名の文脈を維持するため）。
 fn write_table_with_headers(
     out: &mut String,
     rows: &[Vec<String>],
@@ -193,9 +202,22 @@ fn write_table_with_headers(
 ) {
     let (span_map, covered) = build_span_and_covered(merges);
 
-    // 各行が「全幅ヘッダー行」かどうかを判定
-    // 全幅ヘッダー = 非空・非カバーセルが1つだけで、そのspanが列全体 - 1 以上
+    // 各行が「全幅ヘッダー行」かどうかを判定。
+    //
+    // 全幅ヘッダー行の条件:
+    //   1. 有効な分割点: 直前の行からの rowspan がこの行をまたがない
+    //   2. 非空・非カバーセルが1つだけ
+    //   3. テーブルが複数列（単列テーブルでは誤検知が多い）
+    //
+    // 条件1 は colspan なしで行全体に値が1つだけの場合（例: 「(1) 学校数…」）にも
+    // 機能するよう、colspan 要件を廃止した。
     let is_header_row = |ri: usize| -> Option<String> {
+        // 1. 有効な分割点チェック: 直前 rowspan がこの行をまたがないこと
+        let valid_split = merges.iter().all(|&(r, _, rs, _)| !(r < ri && r + rs > ri));
+        if !valid_split {
+            return None;
+        }
+        // 2. 非空・非カバーセルが1つだけ
         let visible_nonempty: Vec<usize> = (0..col_count)
             .filter(|&c| !covered.contains(&(ri, c)))
             .filter(|&c| {
@@ -208,16 +230,15 @@ fn write_table_with_headers(
         if visible_nonempty.len() != 1 {
             return None;
         }
-        let c = visible_nonempty[0];
-        let cs = span_map.get(&(ri, c)).map(|&(_, cs)| cs).unwrap_or(1);
-        if cs >= col_count.saturating_sub(1) {
-            rows.get(ri)
-                .and_then(|r| r.get(c))
-                .filter(|v| !v.is_empty())
-                .map(|v| v.replace('\r', "").replace('\n', " "))
-        } else {
-            None
+        // 3. 複数列テーブルのみ（単列は誤検知を避ける）
+        if col_count <= 1 {
+            return None;
         }
+        let c = visible_nonempty[0];
+        rows.get(ri)
+            .and_then(|r| r.get(c))
+            .filter(|v| !v.is_empty())
+            .map(|v| v.replace('\r', "").replace('\n', " "))
     };
 
     // 行を「ヘッダー」か「データ」かで分類してセグメント化
@@ -238,7 +259,15 @@ fn write_table_with_headers(
         segments.push((None, data_rows));
     }
 
+    // 最初のデータセグメントの行インデックス（サブテーブルのヘッダー繰り返し用）
+    let first_data_rows: &[usize] = segments
+        .iter()
+        .find(|(h, rows)| h.is_none() && !rows.is_empty())
+        .map(|(_, rows)| rows.as_slice())
+        .unwrap_or(&[]);
+
     // セグメントを出力
+    let mut is_first_data_seg = true;
     for (header, row_indices) in &segments {
         if let Some(text) = header {
             writeln!(out, "*{}*\n", escape_cell(text)).unwrap();
@@ -248,27 +277,255 @@ fn write_table_with_headers(
             writeln!(out, r#"[cols="{}",options="header"]"#, cols.join(",")).unwrap();
             writeln!(out, "|===").unwrap();
 
-            for (seg_idx, &ri) in row_indices.iter().enumerate() {
-                if seg_idx == 1 {
-                    writeln!(out).unwrap(); // ヘッダー行とデータ行の間の空行
-                }
-                for ci in 0..col_count {
-                    if covered.contains(&(ri, ci)) {
-                        continue;
+            if is_first_data_seg {
+                // 最初のデータセグメント: 行[0] が AsciiDoc ヘッダー行
+                for (seg_idx, &ri) in row_indices.iter().enumerate() {
+                    if seg_idx == 1 {
+                        writeln!(out).unwrap(); // ヘッダー行とデータ行の間の空行
                     }
-                    let text =
-                        escape_cell(rows.get(ri).and_then(|r| r.get(ci)).map(|s| s.as_str()).unwrap_or(""));
-                    let prefix = span_map
-                        .get(&(ri, ci))
-                        .map(|&(rs, cs)| cell_span_prefix(cs, rs))
-                        .unwrap_or_default();
-                    writeln!(out, "{}| {}", prefix, text).unwrap();
+                    write_row(out, rows, ri, col_count, &covered, &span_map);
+                }
+                is_first_data_seg = false;
+            } else {
+                // 2 番目以降のデータセグメント:
+                //   最初のデータセグメントの行をヘッダーとして繰り返す。
+                //   そのセグメント内に閉じる rowspan のみ保持し、
+                //   データ行は別の covered/span_map を使う。
+                let max_tmpl_ri = first_data_rows.iter().copied().max().unwrap_or(0);
+                let tmpl_set: HashSet<usize> = first_data_rows.iter().copied().collect();
+                let tmpl_merges: Vec<_> = merges
+                    .iter()
+                    .filter(|&&(r, _, rs, _)| tmpl_set.contains(&r) && r + rs <= max_tmpl_ri + 1)
+                    .copied()
+                    .collect();
+                let (tmpl_span_map, tmpl_covered) = build_span_and_covered(&tmpl_merges);
+
+                // データ行専用の covered/span_map（テンプレート行のマージを除外）
+                let data_set: HashSet<usize> = row_indices.iter().copied().collect();
+                let data_merges: Vec<_> = merges
+                    .iter()
+                    .filter(|&&(r, _, _, _)| data_set.contains(&r))
+                    .copied()
+                    .collect();
+                let (data_span_map, data_covered) = build_span_and_covered(&data_merges);
+
+                // ヘッダーテンプレート行を AsciiDoc ヘッダー行として出力
+                for &ri in first_data_rows {
+                    write_row(out, rows, ri, col_count, &tmpl_covered, &tmpl_span_map);
+                }
+                writeln!(out).unwrap(); // ヘッダー行とデータ行の間の空行
+
+                // 実データ行を出力
+                for &ri in row_indices {
+                    write_row(out, rows, ri, col_count, &data_covered, &data_span_map);
                 }
             }
+
             writeln!(out, "|===").unwrap();
             writeln!(out).unwrap();
         }
     }
+}
+
+/// 1行分のセルを AsciiDoc テーブル記法で出力するヘルパー
+fn write_row(
+    out: &mut String,
+    rows: &[Vec<String>],
+    ri: usize,
+    col_count: usize,
+    covered: &HashSet<(usize, usize)>,
+    span_map: &HashMap<(usize, usize), (usize, usize)>,
+) {
+    for ci in 0..col_count {
+        if covered.contains(&(ri, ci)) {
+            continue;
+        }
+        let text = escape_cell(
+            rows.get(ri)
+                .and_then(|r| r.get(ci))
+                .map(|s| s.as_str())
+                .unwrap_or(""),
+        );
+        let prefix = span_map
+            .get(&(ri, ci))
+            .map(|&(rs, cs)| cell_span_prefix(cs, rs))
+            .unwrap_or_default();
+        writeln!(out, "{}| {}", prefix, text).unwrap();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 末尾空行の除去
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// rowspan の端数等によって生じる末尾の「全空行」を除去し、
+/// その行をまたいでいた rowspan を短縮する。
+///
+/// 「全空行」= すべてのセルがカバー済みまたは空文字列である行。
+fn trim_trailing_empty_rows(
+    rows: &[Vec<String>],
+    merges: &[(usize, usize, usize, usize)],
+) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+    let n_rows = rows.len();
+    if n_rows == 0 {
+        return (rows.to_vec(), merges.to_vec());
+    }
+    let (_, covered) = build_span_and_covered(merges);
+
+    // 末尾から走査して最後の「非空行」を探す
+    let keep_rows = (0..n_rows)
+        .rev()
+        .find(|&ri| {
+            rows[ri]
+                .iter()
+                .enumerate()
+                .any(|(ci, v)| !v.is_empty() && !covered.contains(&(ri, ci)))
+        })
+        .map(|r| r + 1)
+        .unwrap_or(0);
+
+    if keep_rows == n_rows {
+        return (rows.to_vec(), merges.to_vec());
+    }
+
+    let new_rows = rows[..keep_rows].to_vec();
+    // rowspan が除去した行にまたがる場合は短縮、除去した行が開始なら削除
+    let new_merges: Vec<_> = merges
+        .iter()
+        .filter_map(|&(r, c, rs, cs)| {
+            if r >= keep_rows {
+                return None; // 開始行自体が除去範囲
+            }
+            let new_rs = rs.min(keep_rows - r);
+            if new_rs > 1 || cs > 1 {
+                Some((r, c, new_rs, cs))
+            } else {
+                None // rowspan=1, colspan=1 はマージではなく省略
+            }
+        })
+        .collect();
+
+    (new_rows, new_merges)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 幽霊列の除去
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 全セルが「カバー済みか空」である「幽霊列（phantom column）」を除去する。
+///
+/// 神エクセル処理後、ヘッダー行だけを対象としたマージの境界として生成された
+/// 論理列が、データ行では空のまま残る場合がある。これを除去して余分な空列を消す。
+///
+/// - マージ開始位置が除去対象列の場合は、マージを次の実列に移動してcolspanを調整する。
+/// - マージが除去対象列をまたぐ場合は、その分だけcolspanを縮小する。
+fn remove_phantom_cols(
+    rows: &[Vec<String>],
+    merges: &[(usize, usize, usize, usize)],
+) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+    let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if n_cols == 0 {
+        return (rows.to_vec(), merges.to_vec());
+    }
+
+    let (span_map, covered) = build_span_and_covered(merges);
+
+    // 幽霊列: 全行において列 c が次のいずれかを満たす
+    //   a) カバー済み
+    //   b) 空
+    //   c) colspan > 1 のマージ開始セル（その列の「実データ」は他列に広がる）
+    //
+    // これにより、ヘッダーの大スパン起点のみに使われる列（データ行では常に空）を検出する。
+    let is_phantom: Vec<bool> = (0..n_cols)
+        .map(|c| {
+            (0..rows.len()).all(|r| {
+                if covered.contains(&(r, c)) {
+                    return true;
+                }
+                let empty = rows
+                    .get(r)
+                    .and_then(|row| row.get(c))
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true);
+                if empty {
+                    return true;
+                }
+                // 非空・非カバー: colspan > 1 のマージ起点の場合のみ幽霊と見なす
+                span_map.get(&(r, c)).map(|&(_, cs)| cs > 1).unwrap_or(false)
+            })
+        })
+        .collect();
+
+    if is_phantom.iter().all(|&p| !p) {
+        return (rows.to_vec(), merges.to_vec());
+    }
+
+    // 旧列 → 新列インデックス（幽霊列は usize::MAX）
+    let mut old_to_new = vec![usize::MAX; n_cols];
+    let mut ni = 0;
+    for (c, &ph) in is_phantom.iter().enumerate() {
+        if !ph {
+            old_to_new[c] = ni;
+            ni += 1;
+        }
+    }
+    let n_new = ni;
+    if n_new == n_cols {
+        return (rows.to_vec(), merges.to_vec());
+    }
+
+    // 新 rows: 幽霊列を除去した値を引き継ぐ
+    let mut new_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            (0..n_cols)
+                .filter(|&c| !is_phantom[c])
+                .map(|c| row.get(c).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect();
+
+    // 幽霊列がマージ開始の場合、その値を次の実列へ移動する。
+    // （値は幽霊列にのみ存在し、新 rows では消えてしまうため）
+    for &(r, c, _, cs) in merges {
+        if !is_phantom[c] {
+            continue;
+        }
+        let val = rows.get(r).and_then(|row| row.get(c)).cloned().unwrap_or_default();
+        if val.is_empty() {
+            continue;
+        }
+        // [c, c+cs) の範囲で最初の実列へ移動
+        if let Some(first_real) = (c..c + cs).find(|&col| col < n_cols && !is_phantom[col]) {
+            let new_c = old_to_new[first_real];
+            if r < new_rows.len() && new_c < new_rows[r].len() && new_rows[r][new_c].is_empty() {
+                new_rows[r][new_c] = val;
+            }
+        }
+    }
+
+    // 新 merges:
+    //   開始列が幽霊の場合は次の実列にシフトして colspan を縮小
+    //   開始列が実の場合は colspan の範囲内の実列数に縮小
+    let new_merges: Vec<_> = merges
+        .iter()
+        .filter_map(|&(r, c, rs, cs)| {
+            // [c, c+cs) の範囲内で最初の実列を探す
+            let first_real = (c..c + cs).find(|&col| col < n_cols && !is_phantom[col])?;
+            let new_c = old_to_new[first_real];
+            // 実列の数
+            let new_cs = (first_real..c + cs)
+                .filter(|&col| col < n_cols && !is_phantom[col])
+                .count();
+            if rs > 1 || new_cs > 1 {
+                Some((r, new_c, rs, new_cs))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (new_rows, new_merges)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
