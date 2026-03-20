@@ -12,7 +12,7 @@ pub struct Args {
     #[arg(long)]
     pub input: PathBuf,
 
-    /// 出力 .adoc ファイルのパス（省略時は標準出力）
+    /// 出力 .adoc ファイルのパス（省略時は入力 JSON と同じディレクトリに .adoc を生成）
     #[arg(long)]
     pub output: Option<PathBuf>,
 }
@@ -25,14 +25,13 @@ pub fn run(args: Args) -> Result<()> {
 
     let adoc = convert(&doc);
 
-    match &args.output {
-        Some(path) => {
-            std::fs::write(path, &adoc)
-                .with_context(|| format!("書き込みに失敗: {}", path.display()))?;
-            eprintln!("✓ {}", path.display());
-        }
-        None => print!("{}", adoc),
-    }
+    let out_path = match &args.output {
+        Some(path) => path.clone(),
+        None => args.input.with_extension("adoc"),
+    };
+    std::fs::write(&out_path, &adoc)
+        .with_context(|| format!("書き込みに失敗: {}", out_path.display()))?;
+    eprintln!("✓ {}", out_path.display());
     Ok(())
 }
 
