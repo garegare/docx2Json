@@ -118,6 +118,12 @@ fn write_element(
             if rows.is_empty() {
                 return;
             }
+
+            // 神エクセル等の多列テーブルを論理列に圧縮
+            let (rows, merges) = compress_columns(rows, merges);
+            let rows = &rows;
+            let merges = &merges;
+
             let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
             if col_count == 0 {
                 return;
@@ -215,6 +221,96 @@ fn cell_span_prefix(colspan: usize, rowspan: usize) -> String {
         (false, true) => format!(".{}+", rowspan),
         (false, false) => String::new(),
     }
+}
+
+/// 神エクセル等の多列テーブルを「論理列」に圧縮する。
+///
+/// 1. マージあり: 全マージの開始列を論理列境界として収集し 125列→11列のように縮小する。
+/// 2. マージなし: 全行で空の列を除去する。
+///
+/// `rows` と `merges` を論理座標に変換して返す。
+fn compress_columns(
+    rows: &[Vec<String>],
+    merges: &[(usize, usize, usize, usize)], // (row, col, rowspan, colspan)
+) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+    if merges.is_empty() {
+        // マージなし: 全行で空の列を除去
+        let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let keep: Vec<usize> = (0..max_cols)
+            .filter(|&c| rows.iter().any(|r| !r.get(c).map(|s| s.is_empty()).unwrap_or(true)))
+            .collect();
+        if keep.len() == max_cols {
+            return (rows.to_vec(), vec![]);
+        }
+        let new_rows = rows
+            .iter()
+            .map(|r| keep.iter().map(|&c| r.get(c).cloned().unwrap_or_default()).collect())
+            .collect();
+        return (new_rows, vec![]);
+    }
+
+    // 1. 全マージ開始列 + 0 を論理列境界として収集
+    let mut boundaries: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    boundaries.insert(0);
+    for &(_, c, _, cs) in merges {
+        boundaries.insert(c);
+        boundaries.insert(c + cs); // 終端境界（次論理列の先頭）
+    }
+
+    let logical_cols: Vec<usize> = boundaries.into_iter().collect(); // ソート済み
+    let n_logical = logical_cols.len();
+
+    // 2. 物理列 → 論理列インデックスのマップを構築
+    //    論理列 i は [logical_cols[i], logical_cols[i+1]) の物理列を担当
+    let phys_to_logical: std::collections::HashMap<usize, usize> = {
+        let max_phys = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut m = std::collections::HashMap::new();
+        for (li, &start) in logical_cols.iter().enumerate() {
+            let end = logical_cols.get(li + 1).copied().unwrap_or(max_phys + 1);
+            for p in start..end.min(max_phys + 1) {
+                m.insert(p, li);
+            }
+        }
+        m
+    };
+
+    // 3. rows を論理列数の配列に縮小（各論理列の先頭物理列の値を使用）
+    let new_rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            let mut new_row = vec![String::new(); n_logical];
+            for (ci, val) in row.iter().enumerate() {
+                if let Some(&li) = phys_to_logical.get(&ci) {
+                    // 先勝ち：論理列がまだ空の場合のみ書き込む
+                    if new_row[li].is_empty() && !val.is_empty() {
+                        new_row[li] = val.clone();
+                    }
+                }
+            }
+            new_row
+        })
+        .collect();
+
+    // 4. merges を論理座標に変換
+    //    物理 col → logical_start
+    //    物理 col+colspan（排他端）→ 論理列インデックスで何論理列分か
+    let new_merges: Vec<(usize, usize, usize, usize)> = merges
+        .iter()
+        .filter_map(|&(r, c, rs, cs)| {
+            let logical_start = *phys_to_logical.get(&c)?;
+            // 排他端 c+cs が論理列境界に収まる位置を探す
+            let phys_end = c + cs;
+            let logical_end = logical_cols.partition_point(|&x| x < phys_end);
+            let logical_cs = logical_end.saturating_sub(logical_start);
+            if rs > 1 || logical_cs > 1 {
+                Some((r, logical_start, rs, logical_cs))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    (new_rows, new_merges)
 }
 
 /// AsciiDoc テーブルセル内の `|` をエスケープし、改行をスペースに変換
