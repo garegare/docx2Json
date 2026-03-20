@@ -129,13 +129,18 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
         })
         .collect();
 
+    let summary = format!(
+        "（全 {} 行 / {} 行ずつ {} チャンクに分割）",
+        data_row_count, max_rows, chunk_count
+    );
     Section {
         context_path: Vec::new(),
         heading: name.to_string(),
-        body_text: format!(
-            "（全 {} 行 / {} 行ずつ {} チャンクに分割）",
-            data_row_count, max_rows, chunk_count
-        ),
+        body_text: summary.clone(),
+        elements: vec![crate::models::Element::Paragraph {
+            text: summary,
+            metadata: crate::models::ElementMetadata::default(),
+        }],
         assets: Vec::new(),
         children,
         ..Default::default()
@@ -164,8 +169,7 @@ fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
     for row in rows {
         if row.iter().all(|s| s.is_empty()) {
             if !current.is_empty() {
-                blocks.push(current.clone());
-                current.clear();
+                blocks.push(std::mem::take(&mut current));
             }
         } else {
             current.push(row.clone());
@@ -405,31 +409,7 @@ fn parse_worksheet(
         grid[r][c] = val;
     }
 
-    // 結合セル展開: 結合元（左上）の値を結合範囲全体にコピー
-    // これにより空文字になっていた結合継続セルが正しい値を持つ
-    for (min_row, min_col, max_row, max_col) in &merges {
-        // 結合元の値を取得（空なら展開しない）
-        let origin = grid
-            .get(*min_row)
-            .and_then(|r| r.get(*min_col))
-            .cloned()
-            .unwrap_or_default();
-        if origin.is_empty() {
-            continue;
-        }
-        for r in *min_row..=*max_row {
-            for c in *min_col..=*max_col {
-                if (r, c) == (*min_row, *min_col) {
-                    continue; // 結合元はスキップ
-                }
-                // グリッド範囲内のセルのみ更新（壊れた merge 指定への防御）
-                if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
-                    cell.clone_from(&origin);
-                }
-            }
-        }
-    }
-
+    expand_merges(&mut grid, &merges);
     Ok(grid)
 }
 
@@ -501,17 +481,41 @@ fn escape_cell(s: &str) -> String {
 
 // ---- ユーティリティ ----
 
+/// 結合セル範囲リストに従い、グリッドの結合元（左上）の値を範囲全体にコピーする
+///
+/// - 結合元が空文字の場合は展開しない
+/// - グリッド範囲外の merge 指定は無視する（破損ファイルへの防御）
+fn expand_merges(grid: &mut Vec<Vec<String>>, merges: &[(usize, usize, usize, usize)]) {
+    for (min_row, min_col, max_row, max_col) in merges {
+        let origin = grid
+            .get(*min_row)
+            .and_then(|r| r.get(*min_col))
+            .cloned()
+            .unwrap_or_default();
+        if origin.is_empty() {
+            continue;
+        }
+        for r in *min_row..=*max_row {
+            for c in *min_col..=*max_col {
+                if (r, c) == (*min_row, *min_col) {
+                    continue; // 結合元はスキップ
+                }
+                if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    cell.clone_from(&origin);
+                }
+            }
+        }
+    }
+}
+
 /// セル参照（"A1"、"AB12" 等）からゼロ始まりの列インデックスを返す
 ///
 /// A=0, B=1, …, Z=25, AA=26, AB=27, …
 fn col_index(cell_ref: &str) -> usize {
-    cell_ref
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .fold(0usize, |acc, c| {
-            acc * 26 + (c.to_ascii_uppercase() as usize - b'A' as usize + 1)
-        })
-        .saturating_sub(1)
+    // parse_cell_address でアドレス全体を解析し、列インデックスのみを返す
+    parse_cell_address(cell_ref)
+        .map(|(_row, col)| col)
+        .unwrap_or(0)
 }
 
 /// "A1:C3" 形式のセル範囲文字列を `(min_row, min_col, max_row, max_col)`（0-indexed）に変換する
@@ -595,31 +599,6 @@ mod tests {
         assert_eq!(parse_merge_range("A1"), None);
     }
 
-    /// 結合セル展開のロジックを単体で検証するヘルパー
-    /// parse_worksheet 内の展開コードと同一ロジック
-    fn apply_merges(grid: &mut Vec<Vec<String>>, merges: &[(usize, usize, usize, usize)]) {
-        for (min_row, min_col, max_row, max_col) in merges {
-            let origin = grid
-                .get(*min_row)
-                .and_then(|r| r.get(*min_col))
-                .cloned()
-                .unwrap_or_default();
-            if origin.is_empty() {
-                continue;
-            }
-            for r in *min_row..=*max_row {
-                for c in *min_col..=*max_col {
-                    if (r, c) == (*min_row, *min_col) {
-                        continue;
-                    }
-                    if let Some(cell) = grid.get_mut(r).and_then(|row| row.get_mut(c)) {
-                        cell.clone_from(&origin);
-                    }
-                }
-            }
-        }
-    }
-
     #[test]
     fn test_merge_expansion_horizontal() {
         // A1:C1 の横結合: "タイトル" が B1, C1 にコピーされる
@@ -627,7 +606,7 @@ mod tests {
             vec!["タイトル".to_string(), String::new(), String::new()],
             vec!["A".to_string(), "B".to_string(), "C".to_string()],
         ];
-        apply_merges(&mut grid, &[(0, 0, 0, 2)]);
+        expand_merges(&mut grid, &[(0, 0, 0, 2)]);
         assert_eq!(grid[0], vec!["タイトル", "タイトル", "タイトル"]);
         assert_eq!(grid[1], vec!["A", "B", "C"]); // 他行は変化なし
     }
@@ -640,7 +619,7 @@ mod tests {
             vec![String::new(), "Y".to_string()],
             vec![String::new(), "Z".to_string()],
         ];
-        apply_merges(&mut grid, &[(0, 0, 2, 0)]);
+        expand_merges(&mut grid, &[(0, 0, 2, 0)]);
         assert_eq!(grid[0][0], "ラベル");
         assert_eq!(grid[1][0], "ラベル");
         assert_eq!(grid[2][0], "ラベル");
@@ -650,7 +629,7 @@ mod tests {
     fn test_merge_expansion_empty_origin_skipped() {
         // 結合元が空の場合は展開しない
         let mut grid = vec![vec![String::new(), String::new(), String::new()]];
-        apply_merges(&mut grid, &[(0, 0, 0, 2)]);
+        expand_merges(&mut grid, &[(0, 0, 0, 2)]);
         assert_eq!(grid[0], vec!["", "", ""]);
     }
 
@@ -739,7 +718,7 @@ mod tests {
     fn test_merge_expansion_out_of_bounds_safe() {
         // 壊れた merge 指定でもパニックしない
         let mut grid = vec![vec!["値".to_string()]];
-        apply_merges(&mut grid, &[(0, 0, 5, 5)]); // グリッド範囲外
+        expand_merges(&mut grid, &[(0, 0, 5, 5)]); // グリッド範囲外
         // グリッド内の (0,0) は変化なし、範囲外への書き込みは無視される
         assert_eq!(grid[0][0], "値");
     }
