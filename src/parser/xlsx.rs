@@ -11,6 +11,9 @@ use zip::ZipArchive;
 use crate::config::Config;
 use crate::models::{Document, Element, ElementMetadata, Section};
 
+/// セル結合範囲: (min_row, min_col, max_row, max_col)（0-based、両端含む）
+type MergeRange = (usize, usize, usize, usize);
+
 /// XLSXファイルを解析してDocumentを返す
 ///
 /// 各シートを1つのSectionに変換する。シートのデータ行数が `config.xlsx.max_rows` を
@@ -53,8 +56,8 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
         let sheet_path = resolve_path(&target);
 
         match parse_worksheet(&mut archive, &sheet_path, &shared_strings) {
-            Ok(grid) => {
-                let section = sheet_to_section(name, grid, config.xlsx.max_rows);
+            Ok((grid, merges)) => {
+                let section = sheet_to_section(name, grid, merges, config.xlsx.max_rows);
                 sections.push(section);
             }
             Err(e) => {
@@ -73,7 +76,7 @@ pub fn parse(path: &Path, config: &Config) -> Result<Document> {
 /// - データ行数 > max_rows の場合:
 ///   親 Section の body_text に概要（行数・チャンク数）を格納し、
 ///   ヘッダー行を引き継いだ子 Section に max_rows 行ずつ分割する。
-fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Section {
+fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, merges: Vec<(usize, usize, usize, usize)>, max_rows: usize) -> Section {
     if rows.is_empty() {
         return Section {
             context_path: Vec::new(),
@@ -93,7 +96,7 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             context_path: Vec::new(),
             heading: name.to_string(),
             body_text: grid_to_markdown(&rows),
-            elements: grid_to_elements(&rows),
+            elements: grid_to_elements(&rows, &merges),
             assets: Vec::new(),
             children: Vec::new(),
             ..Default::default()
@@ -117,11 +120,36 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
             child_rows.push(header.clone());
             child_rows.extend_from_slice(chunk);
 
+            // チャンクに対応するマージ情報を child_rows のローカル座標に変換する。
+            // - ヘッダー行 (orig_row == 0) のマージはそのまま引き継ぐ。
+            // - データ行のマージはチャンク内 (orig_row >= chunk_orig_start) のものだけ抽出し、
+            //   child_rows 上の行番号（1-based）に変換する。
+            // チャンクをまたぐ rowspan は chunk 末尾でクランプする。
+            let chunk_orig_start = 1 + i * max_rows; // シート上のデータ開始行（0-based）
+            let chunk_orig_end = chunk_orig_start + chunk.len() - 1; // 同・終端行（含む）
+            let child_merges: Vec<(usize, usize, usize, usize)> = merges
+                .iter()
+                .filter_map(|&(min_r, min_c, max_r, max_c)| {
+                    if min_r == 0 && max_r == 0 {
+                        // ヘッダー行のみのマージ: child_rows[0] にそのまま適用
+                        return Some((0, min_c, 0, max_c));
+                    }
+                    if min_r >= chunk_orig_start && min_r <= chunk_orig_end {
+                        // データ行のマージ: child_rows 上の行番号に変換
+                        // child_rows[0] はヘッダーなので +1 オフセット
+                        let new_min_r = min_r - chunk_orig_start + 1;
+                        let new_max_r = max_r.min(chunk_orig_end) - chunk_orig_start + 1;
+                        return Some((new_min_r, min_c, new_max_r, max_c));
+                    }
+                    None
+                })
+                .collect();
+
             Section {
                 context_path: Vec::new(), // fill_context_path() で後から設定
                 heading: format!("{} [行 {}–{}]", name, start, end),
                 body_text: grid_to_markdown(&child_rows),
-                elements: grid_to_elements(&child_rows),
+                elements: grid_to_elements(&child_rows, &child_merges),
                 assets: Vec::new(),
                 children: Vec::new(),
                 ..Default::default()
@@ -152,31 +180,37 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, max_rows: usize) -> Sect
 /// 空行を区切りとして「ブロック」を検出し、ブロックごとに Element を生成する:
 /// - 1行かつ非空セルが1つのみ → `Paragraph`（タイトル行・ラベル等）
 /// - それ以外 → `Table`（複数行 or 複数セル）
-fn grid_to_elements(rows: &[Vec<String>]) -> Vec<Element> {
+fn grid_to_elements(rows: &[Vec<String>], sheet_merges: &[(usize, usize, usize, usize)]) -> Vec<Element> {
     split_into_blocks(rows)
         .into_iter()
-        .map(block_to_element)
+        .map(|(block, block_start)| block_to_element(block, block_start, sheet_merges))
         .collect()
 }
 
 /// グリッドを空行区切りでブロックに分割する
 ///
 /// 全セルが空文字の行を区切りとして扱い、連続する非空行をひとまとめにする。
-fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
-    let mut blocks: Vec<Vec<Vec<String>>> = Vec::new();
+/// 戻り値: (ブロック, シート内の開始行インデックス)
+fn split_into_blocks(rows: &[Vec<String>]) -> Vec<(Vec<Vec<String>>, usize)> {
+    let mut blocks = Vec::new();
     let mut current: Vec<Vec<String>> = Vec::new();
+    let mut block_start = 0usize;
 
-    for row in rows {
+    for (row_idx, row) in rows.iter().enumerate() {
         if row.iter().all(|s| s.is_empty()) {
             if !current.is_empty() {
-                blocks.push(std::mem::take(&mut current));
+                blocks.push((std::mem::take(&mut current), block_start));
             }
+            block_start = row_idx + 1;
         } else {
+            if current.is_empty() {
+                block_start = row_idx;
+            }
             current.push(row.clone());
         }
     }
     if !current.is_empty() {
-        blocks.push(current);
+        blocks.push((current, block_start));
     }
     blocks
 }
@@ -188,7 +222,13 @@ fn split_into_blocks(rows: &[Vec<String>]) -> Vec<Vec<Vec<String>>> {
 /// - 非空セルが複数あるが全て同一値（横結合タイトルの展開結果）
 ///
 /// それ以外は `Table` として扱う。
-fn block_to_element(block: Vec<Vec<String>>) -> Element {
+/// `block_start` はシートグリッド内でのこのブロックの開始行インデックス（0-based）。
+/// `sheet_merges` は (min_row, min_col, max_row, max_col) 形式のシート全体のマージ情報。
+fn block_to_element(
+    block: Vec<Vec<String>>,
+    block_start: usize,
+    sheet_merges: &[(usize, usize, usize, usize)],
+) -> Element {
     if block.len() == 1 {
         let non_empty: Vec<&String> = block[0].iter().filter(|s| !s.is_empty()).collect();
         let is_title = match non_empty.len() {
@@ -204,8 +244,31 @@ fn block_to_element(block: Vec<Vec<String>>) -> Element {
             };
         }
     }
+
+    let block_rows = block.len();
+    let block_end = block_start + block_rows - 1; // ブロック最終行（シート絶対座標、含む）
+    // シート絶対座標のマージをブロックローカル (row, col, rowspan, colspan) に変換
+    let merges: Vec<(usize, usize, usize, usize)> = sheet_merges
+        .iter()
+        .filter_map(|&(min_r, min_c, max_r, max_c)| {
+            // このブロック内に開始セルがあるものだけ対象
+            if min_r < block_start || min_r >= block_start + block_rows {
+                return None;
+            }
+            // ブロック外にはみ出す rowspan はブロック末尾でクランプする
+            let clamped_max_r = max_r.min(block_end);
+            let rowspan = clamped_max_r - min_r + 1;
+            let colspan = max_c - min_c + 1;
+            if rowspan == 1 && colspan == 1 {
+                return None; // 1×1 は結合なし
+            }
+            Some((min_r - block_start, min_c, rowspan, colspan))
+        })
+        .collect();
+
     Element::Table {
         rows: block,
+        merges,
         metadata: ElementMetadata::default(),
     }
 }
@@ -331,7 +394,7 @@ fn parse_worksheet(
     archive: &mut ZipArchive<File>,
     path: &str,
     shared_strings: &[String],
-) -> Result<Vec<Vec<String>>> {
+) -> Result<(Vec<Vec<String>>, Vec<MergeRange>)> {
     let content = read_zip_entry(archive, path)?;
     let mut reader = Reader::from_str(&content);
     reader.config_mut().trim_text(true);
@@ -419,7 +482,7 @@ fn parse_worksheet(
 
     // スパースグリッド → 密な 2D Vec
     if max_row == 0 || max_col == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut grid = vec![vec![String::new(); max_col]; max_row];
     for ((r, c), val) in sparse {
@@ -427,7 +490,7 @@ fn parse_worksheet(
     }
 
     expand_merges(&mut grid, &merges);
-    Ok(grid)
+    Ok((grid, merges))
 }
 
 /// セルの型と生の値から表示文字列を返す
@@ -660,7 +723,8 @@ mod tests {
         ];
         let blocks = split_into_blocks(&rows);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].len(), 2);
+        assert_eq!(blocks[0].0.len(), 2);
+        assert_eq!(blocks[0].1, 0); // start_row
     }
 
     #[test]
@@ -673,8 +737,10 @@ mod tests {
         ];
         let blocks = split_into_blocks(&rows);
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].len(), 1);
-        assert_eq!(blocks[1].len(), 2);
+        assert_eq!(blocks[0].0.len(), 1);
+        assert_eq!(blocks[0].1, 0); // start_row
+        assert_eq!(blocks[1].0.len(), 2);
+        assert_eq!(blocks[1].1, 2); // start_row（空行の次）
     }
 
     #[test]
@@ -687,7 +753,7 @@ mod tests {
     fn test_block_to_element_paragraph() {
         // 1行・1セル → Paragraph
         let block = vec![vec!["申請書".to_string(), "".to_string(), "".to_string()]];
-        match block_to_element(block) {
+        match block_to_element(block, 0, &[]) {
             Element::Paragraph { text, .. } => assert_eq!(text, "申請書"),
             other => panic!("Expected Paragraph, got {:?}", other),
         }
@@ -700,7 +766,7 @@ mod tests {
             vec!["A".to_string(), "B".to_string()],
             vec!["1".to_string(), "2".to_string()],
         ];
-        match block_to_element(block) {
+        match block_to_element(block, 0, &[]) {
             Element::Table { rows, .. } => assert_eq!(rows.len(), 2),
             other => panic!("Expected Table, got {:?}", other),
         }
@@ -710,7 +776,7 @@ mod tests {
     fn test_block_to_element_table_multi_cell() {
         // 1行・複数セルで値が異なる → Table
         let block = vec![vec!["部署".to_string(), "総務部".to_string()]];
-        match block_to_element(block) {
+        match block_to_element(block, 0, &[]) {
             Element::Table { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("Expected Table, got {:?}", other),
         }
@@ -724,7 +790,7 @@ mod tests {
             "API仕様書".to_string(),
             "API仕様書".to_string(),
         ]];
-        match block_to_element(block) {
+        match block_to_element(block, 0, &[]) {
             Element::Paragraph { text, .. } => assert_eq!(text, "API仕様書"),
             other => panic!("Expected Paragraph, got {:?}", other),
         }
@@ -738,8 +804,26 @@ mod tests {
             "型".to_string(),
             "必須".to_string(),
         ]];
-        match block_to_element(block) {
+        match block_to_element(block, 0, &[]) {
             Element::Table { .. } => {}
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_block_to_element_merges_block_local() {
+        // シート行2-4のブロック（block_start=2）に (2,0,4,1) のマージ → ローカル (0,0,3,2)
+        let block = vec![
+            vec!["結合".to_string(), "結合".to_string(), "A".to_string()],
+            vec!["結合".to_string(), "結合".to_string(), "B".to_string()],
+            vec!["結合".to_string(), "結合".to_string(), "C".to_string()],
+        ];
+        let sheet_merges = vec![(2usize, 0usize, 4usize, 1usize)]; // min_row=2, min_col=0, max_row=4, max_col=1
+        match block_to_element(block, 2, &sheet_merges) {
+            Element::Table { merges, .. } => {
+                assert_eq!(merges.len(), 1);
+                assert_eq!(merges[0], (0, 0, 3, 2)); // row=0, col=0, rowspan=3, colspan=2
+            }
             other => panic!("Expected Table, got {:?}", other),
         }
     }
@@ -753,7 +837,7 @@ mod tests {
             vec!["部署".to_string(), "総務部".to_string()],
             vec!["担当".to_string(), "田中".to_string()],
         ];
-        let elements = grid_to_elements(&rows);
+        let elements = grid_to_elements(&rows, &[]);
         assert_eq!(elements.len(), 2);
         assert!(matches!(elements[0], Element::Paragraph { .. }));
         assert!(matches!(elements[1], Element::Table { .. }));

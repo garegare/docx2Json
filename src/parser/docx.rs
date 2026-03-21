@@ -386,6 +386,7 @@ fn parse_document_xml(
                         sec.elements.push(Element::Table {
                             metadata: ElementMetadata::default(),
                             rows,
+                            merges: Vec::new(),
                         });
                     }
                     // table_rows は take() 済みなので clear() は不要
