@@ -38,6 +38,7 @@ AIによる文書解析（RAGや要約）の精度を最大化するため、単
 | **カスタム SemanticRole マッピング** | ✅ | `docx.semantic_role_styles` でスタイル名 → SemanticRole を設定ファイルから外部注入可能。 |
 | **出力フィールド制御** | ✅ | `output.include_body_text`（デフォルト: `false`）と `output.include_base64`（デフォルト: `true`）で JSON サイズを最適化。 |
 | **見出しスタイル検査** | ✅ | `inspect-styles` サブコマンド。DOCX の `word/styles.xml` を走査し、見出しスタイル一覧と `docx2json.json` 用 `heading_styles` 設定スニペットを JSON で出力。 |
+| **AsciiDoc 変換出力** | ✅ | `to-asciidoc` サブコマンド。`parse` で生成した `document.json` を AsciiDoc 形式（`.adoc`）に変換。セル結合（rowspan / colspan）を正確に再現し、複雑な表も構造を維持して出力。 |
 
 ## 🛠 技術スタック
 | カテゴリ | ライブラリ | 選定理由 |
@@ -169,6 +170,31 @@ docx2json inspect-styles --input ./sample.docx --output ./heading_config.json
 
 > **ヒント:** `inspect-styles` で検出されなかった場合は、そのファイルが Word 標準の見出しスタイルを使っていない可能性があります。
 > `ppr_underline_as_heading` や `run_underline_as_heading` の設定を検討してください。
+
+### `to-asciidoc` — AsciiDoc 変換
+
+`parse` で生成した `document.json` を AsciiDoc 形式（`.adoc`）に変換します。
+セル結合（rowspan / colspan）を含む複雑な表も AsciiDoc のスパン記法で正確に出力します。
+
+```bash
+# 基本（出力先省略時は入力 JSON と同じディレクトリに .adoc を生成）
+docx2json to-asciidoc --input ./output.json
+
+# 出力先を明示指定
+docx2json to-asciidoc --input ./output.json --output ./doc.adoc
+```
+
+**AsciiDoc 出力の主な特徴:**
+
+| 機能 | 説明 |
+| :--- | :--- |
+| セクション見出し | `context_path` の深さに応じた `==` 〜 `======` レベルで出力 |
+| 表（colspan / rowspan） | `2+\|`（colspan）、`.3+\|`（rowspan）、`2.3+\|`（両方）の AsciiDoc スパン記法を使用 |
+| 空列・幽霊列の除去 | マージ境界だけに存在する空列を自動検出・除去し列数を最適化 |
+| 空行の除去 | rowspan 端数で生じる全空行（中間・末尾とも）を自動除去 |
+| 意味的役割 | `NOTE:` / `WARNING:` / `TIP:` などの AsciiDoc admonition に変換 |
+| セル内改行 | `\n` → ` +\n`（AsciiDoc ハードラインブレーク）で改行を保持 |
+| 特殊文字エスケープ | セル内の `\|` と `\[` を自動エスケープ |
 
 ### AI・ワークフロー連携コマンド
 
@@ -465,5 +491,6 @@ src/
     ├── extract_candidates.rs # LLM 向け候補テキスト抽出（→ JSONL）
     ├── inject_tags.rs        # AI タグ注入 + keywords.json バリデーション
     ├── inspect_styles.rs     # DOCX 見出しスタイル検査（→ heading_styles 設定スニペット）
-    └── summarize.rs          # タグ使用統計横断集計（→ tags_summary.json）
+    ├── summarize.rs          # タグ使用統計横断集計（→ tags_summary.json）
+    └── to_asciidoc.rs        # document.json → AsciiDoc 変換（セル結合・SemanticRole 対応）
 ```
