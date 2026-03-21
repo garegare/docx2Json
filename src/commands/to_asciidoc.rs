@@ -94,23 +94,26 @@ fn write_element(
                 return;
             }
             // SemanticRole に応じたアドモニション
+            // NOTE/WARNING/TIP/CodeBlock/Quote 以外は [ をエスケープして出力
             let adoc = match &metadata.role {
                 Some(crate::models::SemanticRole::Note) => {
-                    format!("NOTE: {}\n", text)
+                    format!("NOTE: {}\n", escape_para(text))
                 }
                 Some(crate::models::SemanticRole::Warning) => {
-                    format!("WARNING: {}\n", text)
+                    format!("WARNING: {}\n", escape_para(text))
                 }
                 Some(crate::models::SemanticRole::Tip) => {
-                    format!("TIP: {}\n", text)
+                    format!("TIP: {}\n", escape_para(text))
                 }
                 Some(crate::models::SemanticRole::CodeBlock) => {
+                    // listing ブロック内はリテラル扱いのためエスケープ不要
                     format!("[source]\n----\n{}\n----\n", text)
                 }
                 Some(crate::models::SemanticRole::Quote) => {
+                    // quote ブロック内もリテラル扱い
                     format!("[quote]\n____\n{}\n____\n", text)
                 }
-                _ => format!("{}\n", text),
+                _ => format!("{}\n", escape_para(text)),
             };
             writeln!(out, "{}", adoc).unwrap();
         }
@@ -848,9 +851,22 @@ fn cell_span_prefix(colspan: usize, rowspan: usize) -> String {
     }
 }
 
-/// AsciiDoc テーブルセル内の `|` をエスケープし、改行をスペースに変換
+/// AsciiDoc テーブルセル内の特殊文字をエスケープする
+///
+/// - `|`  → `\|`  （セル区切り文字）
+/// - `[`  → `\[`  （属性リストとして誤解釈されるのを防ぐ）
+/// - `\n` → ` +\n`（AsciiDoc ハードラインブレーク記法で改行を保持）
+/// - `\r` は除去
 fn escape_cell(s: &str) -> String {
-    s.replace('|', "\\|")
-        .replace('\n', " ")
-        .replace('\r', "")
+    s.replace('\r', "")
+        .replace('|', "\\|")
+        .replace('[', "\\[")
+        .replace('\n', " +\n")
+}
+
+/// AsciiDoc 段落テキスト内の特殊文字をエスケープする
+///
+/// テーブルセル外の段落で `[重要]` などが属性リストとして誤解釈されるのを防ぐ。
+fn escape_para(s: &str) -> String {
+    s.replace('\r', "").replace('[', "\\[")
 }
