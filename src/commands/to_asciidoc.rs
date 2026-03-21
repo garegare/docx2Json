@@ -430,14 +430,33 @@ fn remove_phantom_cols(
 
     let (span_map, covered) = build_span_and_covered(merges);
 
-    // 幽霊列: 全行において列 c が次のいずれかを満たす
-    //   a) カバー済み
-    //   b) 空
-    //   c) colspan > 1 のマージ開始セル（その列の「実データ」は他列に広がる）
+    // 幽霊列: 以下の 2 条件をともに満たす列
     //
-    // これにより、ヘッダーの大スパン起点のみに使われる列（データ行では常に空）を検出する。
+    //   条件1: 全行において列 c が次のいずれか
+    //     a) カバー済み
+    //     b) 空
+    //     c) colspan > 1 のマージ開始セル（値が右方向へ広がる）
+    //
+    //   条件2: rowspan > 1 のマージがこの列から開始しない
+    //     ← rowspan を持つ列は「複数行にまたがる見出し」を担う実列
+    //
+    // 条件1 のみでは「データマージ (cs=2) の開始列」も幽霊と誤判定するため、
+    // rowspan チェックで本物のデータ列を除外する。
+    //
+    // 例: リクエスト表の lc1（パラメータ名）は cs=2 のデータマージ起点だが
+    //     (3,1,rs=2,cs=2) という rowspan マージも持つため幽霊とならない。
+    //     lc2（app_submit 起点）は rs=1 のみ → 幽霊。
+    let has_rowspan_start: Vec<bool> = (0..n_cols)
+        .map(|c| merges.iter().any(|&(_, mc, rs, _)| mc == c && rs > 1))
+        .collect();
+
     let is_phantom: Vec<bool> = (0..n_cols)
         .map(|c| {
+            // 条件2: rowspan 起点があれば幽霊ではない
+            if has_rowspan_start[c] {
+                return false;
+            }
+            // 条件1: 全行が a/b/c のいずれか
             (0..rows.len()).all(|r| {
                 if covered.contains(&(r, c)) {
                     return true;
