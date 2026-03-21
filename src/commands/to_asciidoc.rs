@@ -6,6 +6,12 @@ use anyhow::{Context, Result};
 
 use crate::models::{Document, Element, Section};
 
+/// テーブル変換関数が返す (rows, merges) のペア型
+type TableData = (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>);
+
+/// `build_span_and_covered` の戻り値型（span_map, covered）
+type SpanInfo = (HashMap<(usize, usize), (usize, usize)>, HashSet<(usize, usize)>);
+
 /// `to-asciidoc` サブコマンドの引数
 #[derive(clap::Args)]
 pub struct Args {
@@ -174,7 +180,7 @@ fn write_element(
 /// `merges` から span_map と covered を構築する共通ヘルパー
 fn build_span_and_covered(
     merges: &[(usize, usize, usize, usize)],
-) -> (HashMap<(usize, usize), (usize, usize)>, HashSet<(usize, usize)>) {
+) -> SpanInfo {
     let span_map: HashMap<(usize, usize), (usize, usize)> =
         merges.iter().map(|&(r, c, rs, cs)| ((r, c), (rs, cs))).collect();
     let mut covered: HashSet<(usize, usize)> = HashSet::new();
@@ -371,7 +377,7 @@ fn write_row(
 fn trim_trailing_empty_rows(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)],
-) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+) -> TableData {
     let n_rows = rows.len();
     let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if n_rows == 0 {
@@ -447,7 +453,7 @@ fn trim_trailing_empty_rows(
 fn remove_phantom_cols(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)],
-) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+) -> TableData {
     let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if n_cols == 0 {
         return (rows.to_vec(), merges.to_vec());
@@ -585,7 +591,7 @@ fn remove_phantom_cols(
 fn compress_columns(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)], // (row, col, rowspan, colspan)
-) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+) -> TableData {
     if merges.is_empty() {
         // マージなし: 全行で空の列を除去
         let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
@@ -717,7 +723,7 @@ fn merge_exclusive_cols(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)],
     indent: &str,
-) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
+) -> TableData {
     let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if n_cols <= 1 {
         return (rows.to_vec(), merges.to_vec());
