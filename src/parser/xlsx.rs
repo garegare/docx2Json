@@ -120,11 +120,36 @@ fn sheet_to_section(name: &str, rows: Vec<Vec<String>>, merges: Vec<(usize, usiz
             child_rows.push(header.clone());
             child_rows.extend_from_slice(chunk);
 
+            // チャンクに対応するマージ情報を child_rows のローカル座標に変換する。
+            // - ヘッダー行 (orig_row == 0) のマージはそのまま引き継ぐ。
+            // - データ行のマージはチャンク内 (orig_row >= chunk_orig_start) のものだけ抽出し、
+            //   child_rows 上の行番号（1-based）に変換する。
+            // チャンクをまたぐ rowspan は chunk 末尾でクランプする。
+            let chunk_orig_start = 1 + i * max_rows; // シート上のデータ開始行（0-based）
+            let chunk_orig_end = chunk_orig_start + chunk.len() - 1; // 同・終端行（含む）
+            let child_merges: Vec<(usize, usize, usize, usize)> = merges
+                .iter()
+                .filter_map(|&(min_r, min_c, max_r, max_c)| {
+                    if min_r == 0 && max_r == 0 {
+                        // ヘッダー行のみのマージ: child_rows[0] にそのまま適用
+                        return Some((0, min_c, 0, max_c));
+                    }
+                    if min_r >= chunk_orig_start && min_r <= chunk_orig_end {
+                        // データ行のマージ: child_rows 上の行番号に変換
+                        // child_rows[0] はヘッダーなので +1 オフセット
+                        let new_min_r = min_r - chunk_orig_start + 1;
+                        let new_max_r = max_r.min(chunk_orig_end) - chunk_orig_start + 1;
+                        return Some((new_min_r, min_c, new_max_r, max_c));
+                    }
+                    None
+                })
+                .collect();
+
             Section {
                 context_path: Vec::new(), // fill_context_path() で後から設定
                 heading: format!("{} [行 {}–{}]", name, start, end),
                 body_text: grid_to_markdown(&child_rows),
-                elements: grid_to_elements(&child_rows, &[]),
+                elements: grid_to_elements(&child_rows, &child_merges),
                 assets: Vec::new(),
                 children: Vec::new(),
                 ..Default::default()
@@ -221,6 +246,7 @@ fn block_to_element(
     }
 
     let block_rows = block.len();
+    let block_end = block_start + block_rows - 1; // ブロック最終行（シート絶対座標、含む）
     // シート絶対座標のマージをブロックローカル (row, col, rowspan, colspan) に変換
     let merges: Vec<(usize, usize, usize, usize)> = sheet_merges
         .iter()
@@ -229,7 +255,9 @@ fn block_to_element(
             if min_r < block_start || min_r >= block_start + block_rows {
                 return None;
             }
-            let rowspan = max_r - min_r + 1;
+            // ブロック外にはみ出す rowspan はブロック末尾でクランプする
+            let clamped_max_r = max_r.min(block_end);
+            let rowspan = clamped_max_r - min_r + 1;
             let colspan = max_c - min_c + 1;
             if rowspan == 1 && colspan == 1 {
                 return None; // 1×1 は結合なし
