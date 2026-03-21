@@ -358,52 +358,74 @@ fn write_row(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 末尾空行の除去
+// 全空行の除去
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// rowspan の端数等によって生じる末尾の「全空行」を除去し、
-/// その行をまたいでいた rowspan を短縮する。
+/// 「全空行」をテーブルから除去し、rowspan を調整する。
 ///
-/// 「全空行」= すべてのセルがカバー済みまたは空文字列である行。
+/// 全空行 = すべてのセルが「カバー済み」または「空文字列」である行。
+///
+/// - 末尾だけでなく中間の空行も除去する（rowspan で列がカバーされているが
+///   残りの列が空というパターン、例: 複合ヘッダー行の継続行）。
+/// - 除去した行にまたがる rowspan はその分だけ短縮する。
 fn trim_trailing_empty_rows(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)],
 ) -> (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>) {
     let n_rows = rows.len();
+    let n_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
     if n_rows == 0 {
         return (rows.to_vec(), merges.to_vec());
     }
     let (_, covered) = build_span_and_covered(merges);
 
-    // 末尾から走査して最後の「非空行」を探す
-    let keep_rows = (0..n_rows)
-        .rev()
-        .find(|&ri| {
-            rows[ri]
-                .iter()
-                .enumerate()
-                .any(|(ci, v)| !v.is_empty() && !covered.contains(&(ri, ci)))
+    // 各行が「全空行」かどうか（全列が空またはカバー済み）
+    let is_empty: Vec<bool> = (0..n_rows)
+        .map(|ri| {
+            (0..n_cols).all(|ci| {
+                covered.contains(&(ri, ci))
+                    || rows.get(ri).and_then(|r| r.get(ci)).map(|v| v.is_empty()).unwrap_or(true)
+            })
         })
-        .map(|r| r + 1)
-        .unwrap_or(0);
+        .collect();
 
-    if keep_rows == n_rows {
+    if is_empty.iter().all(|&e| !e) {
         return (rows.to_vec(), merges.to_vec());
     }
 
-    let new_rows = rows[..keep_rows].to_vec();
-    // rowspan が除去した行にまたがる場合は短縮、除去した行が開始なら削除
+    // 残す行の旧番号 → 新番号マッピング
+    let mut old_to_new = vec![usize::MAX; n_rows];
+    let mut new_ri = 0usize;
+    for (ri, &empty) in is_empty.iter().enumerate() {
+        if !empty {
+            old_to_new[ri] = new_ri;
+            new_ri += 1;
+        }
+    }
+
+    let new_rows: Vec<Vec<String>> = rows
+        .iter()
+        .enumerate()
+        .filter(|&(ri, _)| !is_empty[ri])
+        .map(|(_, row)| row.clone())
+        .collect();
+
+    // rowspan 調整:
+    //   開始行が除去された場合はマージ自体を削除
+    //   それ以外は rowspan を「残る行の数」に縮小し、行番号を再マッピング
     let new_merges: Vec<_> = merges
         .iter()
         .filter_map(|&(r, c, rs, cs)| {
-            if r >= keep_rows {
-                return None; // 開始行自体が除去範囲
+            if is_empty[r] {
+                return None; // 開始行が除去
             }
-            let new_rs = rs.min(keep_rows - r);
+            let new_r = old_to_new[r];
+            // [r, r+rs) の範囲内で残す行の数
+            let new_rs = (r..r + rs).filter(|&i| i < n_rows && !is_empty[i]).count();
             if new_rs > 1 || cs > 1 {
-                Some((r, c, new_rs, cs))
+                Some((new_r, c, new_rs, cs))
             } else {
-                None // rowspan=1, colspan=1 はマージではなく省略
+                None
             }
         })
         .collect();
