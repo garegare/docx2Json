@@ -57,6 +57,9 @@ pub struct ElementMetadata {
     pub caption: Option<String>,
 }
 
+/// セル結合情報のタプル型: (row, col, rowspan, colspan) ブロックローカル 0-based
+pub type CellMerge = (usize, usize, usize, usize);
+
 /// セクション内の構造化要素
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -75,7 +78,7 @@ pub enum Element {
         /// セル結合情報: [(row, col, rowspan, colspan)] ブロックローカル 0-based。
         /// 結合なしの場合は省略される（後方互換）。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        merges: Vec<(usize, usize, usize, usize)>,
+        merges: Vec<CellMerge>,
     },
     /// 画像等のアセット参照（assets 配列の id と対応）
     AssetRef {

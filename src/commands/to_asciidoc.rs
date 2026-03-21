@@ -4,10 +4,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::models::{Document, Element, Section};
+use crate::models::{CellMerge, Document, Element, Section};
 
 /// テーブル変換関数が返す (rows, merges) のペア型
-type TableData = (Vec<Vec<String>>, Vec<(usize, usize, usize, usize)>);
+type TableData = (Vec<Vec<String>>, Vec<CellMerge>);
 
 /// `build_span_and_covered` の戻り値型（span_map, covered）
 type SpanInfo = (HashMap<(usize, usize), (usize, usize)>, HashSet<(usize, usize)>);
@@ -138,8 +138,8 @@ fn write_element(
             // Step 2b: 幽霊列（全セルが空またはカバー済みで自身はマージ開始でない）を除去
             let (rows, merges) = remove_phantom_cols(&rows, &merges);
 
-            // Step 3: 末尾の全空行を除去（rowspan の端数により生じる空行対策）
-            let (rows, merges) = trim_trailing_empty_rows(&rows, &merges);
+            // Step 3: 全空行を除去（末尾だけでなく中間の rowspan 端数行も対象）
+            let (rows, merges) = remove_empty_rows(&rows, &merges);
 
             let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
             if col_count == 0 {
@@ -276,7 +276,7 @@ fn write_table_with_headers(
         .unwrap_or(&[]);
 
     // セグメントを出力
-    let mut is_first_data_seg = true;
+    let mut data_seg_idx = 0usize;
     for (header, row_indices) in &segments {
         if let Some(text) = header {
             writeln!(out, "*{}*\n", escape_cell(text)).unwrap();
@@ -286,7 +286,7 @@ fn write_table_with_headers(
             writeln!(out, r#"[cols="{}",options="header"]"#, cols.join(",")).unwrap();
             writeln!(out, "|===").unwrap();
 
-            if is_first_data_seg {
+            if data_seg_idx == 0 {
                 // 最初のデータセグメント: 行[0] が AsciiDoc ヘッダー行
                 for (seg_idx, &ri) in row_indices.iter().enumerate() {
                     if seg_idx == 1 {
@@ -294,7 +294,7 @@ fn write_table_with_headers(
                     }
                     write_row(out, rows, ri, col_count, &covered, &span_map);
                 }
-                is_first_data_seg = false;
+                data_seg_idx += 1;
             } else {
                 // 2 番目以降のデータセグメント:
                 //   最初のデータセグメントの行をヘッダーとして繰り返す。
@@ -328,6 +328,7 @@ fn write_table_with_headers(
                 for &ri in row_indices {
                     write_row(out, rows, ri, col_count, &data_covered, &data_span_map);
                 }
+                data_seg_idx += 1;
             }
 
             writeln!(out, "|===").unwrap();
@@ -374,7 +375,7 @@ fn write_row(
 /// - 末尾だけでなく中間の空行も除去する（rowspan で列がカバーされているが
 ///   残りの列が空というパターン、例: 複合ヘッダー行の継続行）。
 /// - 除去した行にまたがる rowspan はその分だけ短縮する。
-fn trim_trailing_empty_rows(
+fn remove_empty_rows(
     rows: &[Vec<String>],
     merges: &[(usize, usize, usize, usize)],
 ) -> TableData {
@@ -645,7 +646,9 @@ fn compress_columns(
                 }
             }
         }
-        // 2行以上で出現するスタンドアロン列を境界として追加
+        // 2行以上で出現するスタンドアロン列を境界として追加する。
+        // 閾値を 2 とするのは、1行だけの単独値はノイズ（空きセルや一時的な値）の
+        // 可能性が高く、誤った境界挿入でテーブル列が増殖するのを防ぐため。
         for (c, &freq) in &standalone_freq {
             if freq >= 2 {
                 boundaries.insert(*c);
@@ -897,4 +900,185 @@ fn escape_cell(s: &str) -> String {
 /// テーブルセル外の段落で `[重要]` などが属性リストとして誤解釈されるのを防ぐ。
 fn escape_para(s: &str) -> String {
     s.replace('\r', "").replace('[', "\\[")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(data: &[&[&str]]) -> Vec<Vec<String>> {
+        data.iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    // ─── cell_span_prefix ───
+
+    #[test]
+    fn test_cell_span_prefix_none() {
+        assert_eq!(cell_span_prefix(1, 1), "");
+    }
+
+    #[test]
+    fn test_cell_span_prefix_colspan() {
+        assert_eq!(cell_span_prefix(3, 1), "3+");
+    }
+
+    #[test]
+    fn test_cell_span_prefix_rowspan() {
+        assert_eq!(cell_span_prefix(1, 2), ".2+");
+    }
+
+    #[test]
+    fn test_cell_span_prefix_both() {
+        assert_eq!(cell_span_prefix(2, 3), "2.3+");
+    }
+
+    // ─── escape_cell ───
+
+    #[test]
+    fn test_escape_cell_pipe() {
+        assert_eq!(escape_cell("a|b"), "a\\|b");
+    }
+
+    #[test]
+    fn test_escape_cell_bracket() {
+        assert_eq!(escape_cell("[test]"), "\\[test]");
+    }
+
+    #[test]
+    fn test_escape_cell_newline() {
+        assert_eq!(escape_cell("a\nb"), "a +\nb");
+    }
+
+    #[test]
+    fn test_escape_cell_cr_removed() {
+        assert_eq!(escape_cell("a\r\nb"), "a +\nb");
+    }
+
+    // ─── remove_empty_rows ───
+
+    #[test]
+    fn test_remove_empty_rows_no_empty() {
+        let r = rows(&[&["A", "B"], &["1", "2"]]);
+        let (new_rows, new_merges) = remove_empty_rows(&r, &[]);
+        assert_eq!(new_rows.len(), 2);
+        assert!(new_merges.is_empty());
+    }
+
+    #[test]
+    fn test_remove_empty_rows_trailing() {
+        // 末尾の全空行を除去する
+        let r = rows(&[&["A", "B"], &["", ""]]);
+        let (new_rows, _) = remove_empty_rows(&r, &[]);
+        assert_eq!(new_rows.len(), 1);
+        assert_eq!(new_rows[0], vec!["A", "B"]);
+    }
+
+    #[test]
+    fn test_remove_empty_rows_intermediate() {
+        // 中間の全空行（rowspan カバーのみの行）も除去する
+        // row0: ["A", "B"]  merges: (0,0,2,1) → row1,row2 の col0 はカバー済み
+        // row1: ["",  "X"]  col0=covered, col1=非空 → NOT all empty
+        // row2: ["",  ""]   col0=covered, col1=空   → all empty → 除去
+        let r = rows(&[&["A", "B"], &["", "X"], &["", ""]]);
+        let merges = vec![(0usize, 0usize, 3usize, 1usize)]; // (row,col,rowspan,colspan)
+        let (new_rows, new_merges) = remove_empty_rows(&r, &merges);
+        assert_eq!(new_rows.len(), 2);
+        // rowspan は 2 に縮小される
+        assert!(new_merges.iter().any(|&(r, c, rs, cs)| r == 0 && c == 0 && rs == 2 && cs == 1));
+    }
+
+    // ─── compress_columns ───
+
+    #[test]
+    fn test_compress_columns_no_merges_removes_empty_cols() {
+        // 列1が全行空 → 除去
+        let r = rows(&[&["A", "", "C"], &["1", "", "3"]]);
+        let (new_rows, _) = compress_columns(&r, &[]);
+        assert_eq!(new_rows[0], vec!["A", "C"]);
+        assert_eq!(new_rows[1], vec!["1", "3"]);
+    }
+
+    #[test]
+    fn test_compress_columns_no_merges_all_used() {
+        let r = rows(&[&["A", "B"], &["1", "2"]]);
+        let (new_rows, _) = compress_columns(&r, &[]);
+        assert_eq!(new_rows.len(), 2);
+        assert_eq!(new_rows[0].len(), 2);
+    }
+
+    #[test]
+    fn test_compress_columns_with_merges_title_compressed() {
+        // タイトルが物理列0〜2 (colspan=3) にまたがるケース。
+        // row1 の A,B,C は各1回のみ出現 (freq<2) → 境界に追加されない。
+        // 結果: 論理列 [0, 3] の2列, タイトルは論理列0 に収まり colspan=1 → merges なし
+        let r = rows(&[&["タイトル", "", ""], &["A", "B", "C"]]);
+        let merges = vec![(0usize, 0usize, 1usize, 3usize)]; // (row,col,rowspan,colspan)
+        let (new_rows, new_merges) = compress_columns(&r, &merges);
+        assert_eq!(new_rows[0][0], "タイトル");
+        // 3物理列が1論理列に圧縮されたため colspan=1 → マージ不要
+        assert!(new_merges.is_empty());
+    }
+
+    #[test]
+    fn test_compress_columns_with_merges_rowspan_preserved() {
+        // rowspan=2 のマージが論理座標に変換されて保持されるケース
+        // row0: "ラベル" at col0, rowspan=2 / "値1" at col1
+        // row1: ""       at col0 (カバー済み)   / "値2" at col1
+        let r = rows(&[&["ラベル", "値1"], &["", "値2"]]);
+        let merges = vec![(0usize, 0usize, 2usize, 1usize)]; // rowspan=2, colspan=1
+        let (new_rows, new_merges) = compress_columns(&r, &merges);
+        assert_eq!(new_rows[0].len(), 2); // 論理列は2列
+        // rowspan=2 は保持される
+        assert!(new_merges.iter().any(|&(_, _, rs, _)| rs == 2));
+    }
+
+    // ─── remove_phantom_cols ───
+
+    #[test]
+    fn test_remove_phantom_cols_removes_all_empty_col() {
+        // 列1が全行空 → 幽霊列として除去
+        let r = rows(&[&["A", "", "C"], &["1", "", "3"]]);
+        let (new_rows, _) = remove_phantom_cols(&r, &[]);
+        assert_eq!(new_rows[0], vec!["A", "C"]);
+    }
+
+    #[test]
+    fn test_remove_phantom_cols_keeps_rowspan_col() {
+        // 列0が rowspan>1 のマージ起点 → 幽霊ではない
+        let r = rows(&[&["A", "B"], &["", "C"]]);
+        let merges = vec![(0usize, 0usize, 2usize, 1usize)]; // rowspan=2
+        let (new_rows, _) = remove_phantom_cols(&r, &merges);
+        // 列0は rowspan起点なので保持
+        assert_eq!(new_rows[0].len(), 2);
+    }
+
+    // ─── merge_exclusive_cols ───
+
+    #[test]
+    fn test_merge_exclusive_cols_single_col_no_change() {
+        let r = rows(&[&["A"], &["B"]]);
+        let (new_rows, _) = merge_exclusive_cols(&r, &[], "　");
+        assert_eq!(new_rows, r);
+    }
+
+    #[test]
+    fn test_merge_exclusive_cols_exclusive_pair_merged() {
+        // 列0と列1が排他的（各行でどちらか一方のみ非空）→ 1列に統合
+        let r = rows(&[&["A", ""], &["", "B"], &["C", ""]]);
+        let (new_rows, _) = merge_exclusive_cols(&r, &[], "　");
+        assert_eq!(new_rows[0].len(), 1);
+        assert_eq!(new_rows[0][0], "A");
+        // 列1のものはインデント付き（depth=1）
+        assert_eq!(new_rows[1][0], "　B");
+    }
+
+    #[test]
+    fn test_merge_exclusive_cols_non_exclusive_not_merged() {
+        // 両方が非空の行がある場合は統合しない
+        let r = rows(&[&["A", "B"], &["C", "D"]]);
+        let (new_rows, _) = merge_exclusive_cols(&r, &[], "　");
+        assert_eq!(new_rows[0].len(), 2);
+    }
 }
